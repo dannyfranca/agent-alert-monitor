@@ -15,12 +15,20 @@ def test_systemd_units_persist_hermes_cli_path_for_live_mode() -> None:
 def test_live_mode_docs_include_systemd_hermes_path_smoke_test() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     env_example = Path(".env.example").read_text(encoding="utf-8")
+    systemd_section = readme.split("## systemd user services", maxsplit=1)[1]
+    smoke_test = systemd_section.split(
+        "Smoke-test the installed user service", maxsplit=1
+    )[1]
+    smoke_test = smoke_test.split("## Common commands", maxsplit=1)[0]
 
     assert (
-        "systemctl --user show agent-alert-monitor-ingest.service --property=Environment"
-        in readme
+        'SYSTEMD_ENV="$(systemctl --user show agent-alert-monitor-ingest.service '
+        '--property=Environment --value)"' in smoke_test
     )
-    assert "hermes" in readme.split("## systemd user services", maxsplit=1)[1]
+    assert 'printf "%s\\n" "$SYSTEMD_ENV" | tr " " "\\n" | grep "^PATH="' in smoke_test
+    assert '--property=Environment="$SYSTEMD_ENV"' in smoke_test
+    assert "PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" not in smoke_test
+    assert "hermes" in systemd_section
     assert "%h/.local/bin" in env_example
 
 

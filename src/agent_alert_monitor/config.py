@@ -259,11 +259,10 @@ def load_config(
     if not isinstance(data, dict):
         raise ValueError("config root must be a mapping")
 
-    top_level = _expand_env(
-        {key: value for key, value in data.items() if key != "projects"},
-        env_map,
-        strict=True,
-    )
+    top_level_source = {key: value for key, value in data.items() if key != "projects"}
+    if project_slug is not None:
+        top_level_source.pop("default_project", None)
+    top_level = _expand_env(top_level_source, env_map, strict=True)
     runtime = _runtime_config(top_level, config_dir=path.parent)
     watchdog = _watchdog_config(top_level)
     has_projects_section = data.get("projects") is not None

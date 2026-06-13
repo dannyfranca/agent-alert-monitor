@@ -164,6 +164,38 @@ projects:
     assert cfg.telegram.bot_token == "alpha-token"
 
 
+def test_explicit_project_does_not_require_env_driven_default_project(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        """
+default_project: ${DEFAULT_PROJECT}
+runtime:
+  state_dir: ./state
+projects:
+  - slug: sample-api
+    telegram:
+      alert_chat_id: "-100111"
+    hermes:
+      coordinator_profile: sample-coordinator
+    kanban:
+      incident_assignee: sample-debugger
+  - slug: worker-queue
+    telegram:
+      alert_chat_id: "-100222"
+    hermes:
+      coordinator_profile: worker-coordinator
+    kanban:
+      incident_assignee: worker-debugger
+""".strip(),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_file, project_slug="worker-queue", env={})
+
+    assert cfg.project.slug == "worker-queue"
+    assert cfg.kanban.incident_assignee == "worker-debugger"
+
+
 def test_unknown_project_selection_is_rejected(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(

@@ -325,10 +325,12 @@ Install example units for the current user:
 ./scripts/systemd-install.sh
 systemctl --user edit agent-alert-monitor-ingest.service
 systemctl --user daemon-reload
-systemctl --user show agent-alert-monitor-ingest.service --property=Environment
+SYSTEMD_ENV="$(systemctl --user show agent-alert-monitor-ingest.service --property=Environment --value)"
+SYSTEMD_WORKDIR="$(systemctl --user show agent-alert-monitor-ingest.service --property=WorkingDirectory --value)"
+printf "%s\n" "$SYSTEMD_ENV" | tr " " "\n" | grep "^PATH="
 systemd-run --user --wait --collect --pty \
-  --property=WorkingDirectory="$PWD" \
-  --property=Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  --property=WorkingDirectory="${SYSTEMD_WORKDIR:-$PWD}" \
+  --property=Environment="$SYSTEMD_ENV" \
   /usr/bin/env sh -lc 'command -v hermes && hermes --version'
 systemctl --user enable --now agent-alert-monitor-ingest.service agent-alert-monitor-watchdog.timer
 ```
@@ -337,18 +339,20 @@ The install script substitutes the current repo path into the unit files. Run it
 
 The bundled units persist a service PATH of `%h/.local/bin:/usr/local/bin:/usr/bin:/bin` so non-dry live card creation can resolve a standard `hermes` install even when the user manager did not inherit your shell PATH. If `hermes` is installed somewhere else, add a user-service override that sets `Environment=PATH=...` before enabling live mode.
 
-Smoke-test the same systemd environment that will run the listener:
+Smoke-test the installed user service's resolved environment before enabling live mode. This reads the `Environment=` and `WorkingDirectory=` values from `agent-alert-monitor-ingest.service`, so user-service overrides for a custom Hermes install are included in the check:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user show agent-alert-monitor-ingest.service --property=Environment
+SYSTEMD_ENV="$(systemctl --user show agent-alert-monitor-ingest.service --property=Environment --value)"
+SYSTEMD_WORKDIR="$(systemctl --user show agent-alert-monitor-ingest.service --property=WorkingDirectory --value)"
+printf "%s\n" "$SYSTEMD_ENV" | tr " " "\n" | grep "^PATH="
 systemd-run --user --wait --collect --pty \
-  --property=WorkingDirectory="$PWD" \
-  --property=Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  --property=WorkingDirectory="${SYSTEMD_WORKDIR:-$PWD}" \
+  --property=Environment="$SYSTEMD_ENV" \
   /usr/bin/env sh -lc 'command -v hermes && hermes --version'
 ```
 
-The `command -v hermes` line should print the Hermes binary path before you rely on non-dry `listen` or `watchdog-due --send-telegram`.
+The `grep "^PATH="` line should print the PATH resolved from the installed user service, and the `command -v hermes` line should print the Hermes binary path before you rely on non-dry `listen` or `watchdog-due --send-telegram`. If you installed Hermes outside that PATH, update the service override with `systemctl --user edit agent-alert-monitor-ingest.service`, reload the user manager, and re-run this smoke test.
 
 ## Common commands
 

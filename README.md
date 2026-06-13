@@ -324,10 +324,31 @@ Install example units for the current user:
 ```bash
 ./scripts/systemd-install.sh
 systemctl --user edit agent-alert-monitor-ingest.service
+systemctl --user daemon-reload
+systemctl --user show agent-alert-monitor-ingest.service --property=Environment
+systemd-run --user --wait --collect --pty \
+  --property=WorkingDirectory="$PWD" \
+  --property=Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  /usr/bin/env sh -lc 'command -v hermes && hermes --version'
 systemctl --user enable --now agent-alert-monitor-ingest.service agent-alert-monitor-watchdog.timer
 ```
 
 The install script substitutes the current repo path into the unit files. Run it from the clone path you intend to operate. On headless VMs, ensure the user manager survives logout with `loginctl enable-linger <user>` if that is not already configured.
+
+The bundled units persist a service PATH of `%h/.local/bin:/usr/local/bin:/usr/bin:/bin` so non-dry live card creation can resolve a standard `hermes` install even when the user manager did not inherit your shell PATH. If `hermes` is installed somewhere else, add a user-service override that sets `Environment=PATH=...` before enabling live mode.
+
+Smoke-test the same systemd environment that will run the listener:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user show agent-alert-monitor-ingest.service --property=Environment
+systemd-run --user --wait --collect --pty \
+  --property=WorkingDirectory="$PWD" \
+  --property=Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  /usr/bin/env sh -lc 'command -v hermes && hermes --version'
+```
+
+The `command -v hermes` line should print the Hermes binary path before you rely on non-dry `listen` or `watchdog-due --send-telegram`.
 
 ## Common commands
 

@@ -31,6 +31,41 @@ def test_watchdog_emits_stalled_message_for_silent_open_incident(tmp_path: Path)
     assert due[0].message.startswith("🚨 Alert monitor stalled")
 
 
+def test_watchdog_filters_by_incident_scope_when_requested(tmp_path: Path) -> None:
+    ledger = AlertLedger(tmp_path / "ledger.sqlite")
+    opened = datetime(2026, 6, 13, 12, tzinfo=UTC)
+    parsed = parse_alert_text("ALARM: Service5xx service=api")
+    alpha_scope = "project:sample-api|profile:alpha-coordinator|board:alpha-board"
+    beta_scope = "project:sample-api|profile:beta-coordinator|board:beta-board"
+    ledger.open_incident(
+        "t_same",
+        "sample-api:service5xx",
+        parsed,
+        "investigating",
+        now=opened,
+        incident_scope=alpha_scope,
+    )
+    ledger.open_incident(
+        "t_same",
+        "sample-api:service5xx",
+        parsed,
+        "investigating",
+        now=opened,
+        incident_scope=beta_scope,
+    )
+
+    due = evaluate_stalled_incidents(
+        ledger,
+        now=opened + timedelta(minutes=16),
+        policy=WatchdogPolicy(stalled_after_seconds=15 * 60),
+        project_slug="sample-api",
+        incident_scope=alpha_scope,
+    )
+
+    assert len(due) == 1
+    assert due[0].incident_scope == alpha_scope
+
+
 def test_watchdog_stays_silent_when_recent_status_exists(tmp_path: Path) -> None:
     ledger = AlertLedger(tmp_path / "ledger.sqlite")
     opened = datetime(2026, 6, 13, 12, tzinfo=UTC)

@@ -179,6 +179,38 @@ def test_duplicate_without_incident_retries_kanban_create(tmp_path: Path) -> Non
     assert len(kanban.created_cards) == 1
 
 
+def test_unmatched_recovery_posts_visible_feedback_in_live_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = AlertLedger(tmp_path / "ledger.sqlite")
+    config = make_config(tmp_path)
+    coordinator = AlertCoordinator(config, ledger=ledger, kanban_client=RecordingKanbanClient())
+    sent_messages: list[str] = []
+
+    monkeypatch.setattr(
+        "agent_alert_monitor.telegram_ingest.requests.get",
+        lambda *args, **kwargs: FakeTelegramResponse(
+            telegram_update(42, 2, "OK: Service5xx service=api")
+        ),
+    )
+
+    def fake_post(*args, **kwargs):
+        sent_messages.append(kwargs["json"]["text"])
+        return FakeTelegramResponse({"ok": True})
+
+    monkeypatch.setattr("agent_alert_monitor.telegram_ingest.requests.post", fake_post)
+
+    results = poll_once(config, coordinator, dry_run=False)
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.action == "recovery_unmatched"
+    assert result.incident_task_id is None
+    assert result.channel_message
+    assert "Status: recovery alert did not match an open incident" in result.channel_message
+    assert sent_messages == [result.channel_message]
+
+
 def test_duplicate_recovery_retry_can_finalize_open_incident(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

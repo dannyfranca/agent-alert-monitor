@@ -88,12 +88,13 @@ def poll_once(
                     ),
                 )
             raise
-        if not dry_run and result.incident_task_id and result.channel_message:
+        if not dry_run and result.channel_message:
             send_telegram_message(config, result.channel_message)
-            status = "correlated" if result.action in {"correlated", "duplicate"} else "acked"
-            if result.action in {"recovery_matched", "resolved"}:
-                status = "final"
-            coordinator.record_channel_delivery(result, status)
+            if result.incident_task_id:
+                status = "correlated" if result.action in {"correlated", "duplicate"} else "acked"
+                if result.action in {"recovery_matched", "resolved"}:
+                    status = "final"
+                coordinator.record_channel_delivery(result, status)
         results.append(result)
     if max_update_id is not None and offset_path and not dry_run:
         write_offset(offset_path, max_update_id + 1)
@@ -165,12 +166,13 @@ def poll_once_many(
                     ),
                 )
             raise
-        if not dry_run and result.incident_task_id and result.channel_message:
+        if not dry_run and result.channel_message:
             send_telegram_message(target_config, result.channel_message)
-            status = "correlated" if result.action in {"correlated", "duplicate"} else "acked"
-            if result.action in {"recovery_matched", "resolved"}:
-                status = "final"
-            coordinator.record_channel_delivery(result, status)
+            if result.incident_task_id:
+                status = "correlated" if result.action in {"correlated", "duplicate"} else "acked"
+                if result.action in {"recovery_matched", "resolved"}:
+                    status = "final"
+                coordinator.record_channel_delivery(result, status)
         results.append((target_config.project_slug, result))
 
     if max_update_id is not None and not dry_run:

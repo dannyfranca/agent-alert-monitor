@@ -138,15 +138,71 @@ stateDiagram-v2
 ## Prerequisites
 
 - Linux host with Python 3.11+.
-- Hermes installed locally with Kanban enabled.
+- Hermes CLI installed and configured on the same host that will run this package. See the Hermes install guide: <https://hermes-agent.nousresearch.com/docs/getting-started/installation>.
+- Hermes Kanban enabled and initialized, with the board slugs and worker profiles named in `config.yaml` already created. See the Kanban guide: <https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban>.
 - Telegram listener bot token per monitored source. Each listener bot must be an admin of its alert channel so it can receive `channel_post` updates.
-- Hermes coordinator/debugger profiles and target Kanban board slugs already created and usable from the local Hermes CLI.
 - Optional cloud/provider CLIs configured readonly if debugger workers will inspect logs, metrics, deploys, or traces.
 - Optional: `gh` for release/tag workflows if you use GitHub.
+
+## Hermes and Kanban live-mode prerequisite setup
+
+`scripts/install.sh` installs only this Python package into `.venv`; it does not install or configure Hermes. For the clone → install → dry-run evaluation path, you can skip this section temporarily and use the local dry-run commands below. Live `ingest`/`listen` shells out to the local `hermes` CLI to create Kanban incident cards, so complete these prerequisites before you disable `--dry-run`.
+
+Generic setup path:
+
+1. Install Hermes CLI on the host:
+
+   ```bash
+   curl -fsSLO https://hermes-agent.nousresearch.com/install.sh
+   less install.sh          # inspect the installer, or follow the official guide above
+   bash install.sh
+   export PATH="$HOME/.local/bin:$PATH"  # or open a new shell after install
+   hermes setup --portal   # or run hermes setup and choose your provider/model
+   hermes doctor
+   ```
+
+2. Create or configure the coordinator and worker profiles that your `config.yaml` will reference. Profiles are isolated Hermes homes; see <https://hermes-agent.nousresearch.com/docs/user-guide/profiles>.
+
+   ```bash
+   hermes profile create alert-coordinator --description "Routes alert monitor incidents into Kanban."
+   hermes profile create debugger --description "Investigates alert incidents and posts status."
+   hermes profile create worker-alert-coordinator --description "Routes worker alert incidents into Kanban."
+   hermes profile create worker-debugger --description "Investigates worker alert incidents."
+   hermes -p alert-coordinator setup
+   hermes -p debugger setup
+   hermes -p worker-alert-coordinator setup
+   hermes -p worker-debugger setup
+   ```
+
+   The four profile names above match the stock `config.example.yaml`. If you rename profiles, update `projects[].hermes.coordinator_profile` and `projects[].kanban.incident_assignee` to the same names.
+
+3. Initialize Kanban and create the board slugs from `config.yaml`:
+
+   ```bash
+   hermes -p alert-coordinator kanban init
+   hermes -p alert-coordinator kanban boards create sample-api-incidents --name "Sample API incidents"
+   hermes -p worker-alert-coordinator kanban init
+   hermes -p worker-alert-coordinator kanban boards create worker-incidents --name "Worker incidents"
+   hermes -p alert-coordinator kanban boards list
+   hermes -p worker-alert-coordinator kanban boards list
+   hermes -p alert-coordinator gateway install   # one-time service install; use `hermes -p alert-coordinator gateway run` instead for foreground mode
+   hermes -p alert-coordinator gateway start
+   hermes -p alert-coordinator gateway status
+   hermes -p worker-alert-coordinator gateway install
+   hermes -p worker-alert-coordinator gateway start
+   hermes -p worker-alert-coordinator gateway status
+   hermes -p alert-coordinator kanban --board sample-api-incidents create \
+     "smoke test incident" --assignee debugger --body "Verify dispatcher/profile wiring."
+   ```
+
+   The final command should create a task on the named board without errors. Repeat the smoke-test create under `worker-alert-coordinator` for `worker-incidents` if you keep the stock worker project enabled. `hermes -p <coordinator-profile> gateway status` should show a running gateway/dispatcher before you rely on automatic worker pickup for that profile.
+
+4. Then clone and install this package, copy `config.example.yaml`, and run dry-run synthetic alerts for each project. Only switch to live mode after the dry-run JSON shows the right project title/body, assignee, tenant, and channel message; validate the Kanban board slug separately with the smoke-test `hermes kanban --board ... create` command above.
 
 ## Install locally
 
 ```bash
+git clone https://github.com/dannyfranca/agent-alert-monitor.git agent-alert-monitor
 cd agent-alert-monitor
 ./scripts/install.sh
 cp config.example.yaml config.yaml
@@ -291,7 +347,13 @@ agent-alert-monitor --config config.yaml --project worker-queue ingest --dry-run
 
 # Print watchdog findings as JSON
 agent-alert-monitor --config config.yaml watchdog-due
+
+# Mark an incident closed only after a visible final channel status was posted
+agent-alert-monitor --config config.yaml incident-update \
+  --incident t_example --status resolved --last-channel-status final
 ```
+
+`incident-update --status done|closed|resolved` intentionally requires `--last-channel-status final` (or an already-recorded final status) so local ledger closure cannot silently bypass the channel outcome and watchdog path.
 
 ## Security model
 

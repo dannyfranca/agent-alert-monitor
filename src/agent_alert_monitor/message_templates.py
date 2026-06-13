@@ -67,6 +67,17 @@ def recovered_message(
     )
 
 
+def recovery_unmatched_message(signal: str, prefix: str = "Alert monitor") -> str:
+    return "\n".join(
+        [
+            f"ℹ️ {prefix}",
+            "Status: recovery alert did not match an open incident",
+            f"Signal: {_clip(signal)}",
+            "Next: no incident was closed; monitor remains active.",
+        ]
+    )
+
+
 def coder_queued_message(
     incident_task_id: str,
     coder_task_id: str,

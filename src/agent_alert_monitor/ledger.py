@@ -28,11 +28,13 @@ class IngestResult:
     fingerprint: str
     parsed: ParsedAlert
     correlated_incident_task_id: str | None = None
+    correlated_incident_scope: str | None = None
 
 
 @dataclass(frozen=True)
 class Incident:
     incident_task_id: str
+    incident_scope: str
     fingerprint: str
     status: str
     severity: str | None
@@ -52,6 +54,27 @@ INCIDENT_STATUSES = OPEN_STATUSES | CLOSED_STATUSES
 CHANNEL_STATUSES = {"acked", "correlated", "progress", "watchdog-stalled", "final"}
 STATE_DIR_MODE = 0o700
 LEDGER_FILE_MODE = 0o600
+DEFAULT_INCIDENT_SCOPE = "default"
+
+
+def _normalize_incident_scope(incident_scope: str | None) -> str:
+    return incident_scope or DEFAULT_INCIDENT_SCOPE
+
+
+def _project_slug_from_scope(incident_scope: str) -> str | None:
+    for part in incident_scope.split("|"):
+        if part.startswith("project:"):
+            return part.removeprefix("project:")
+    return None
+
+
+def _fingerprint_matches_scope(fingerprint: str, incident_scope: str) -> bool:
+    project_slug = _project_slug_from_scope(incident_scope)
+    if project_slug is None:
+        return incident_scope == DEFAULT_INCIDENT_SCOPE and ":" not in fingerprint
+    if project_slug == "default":
+        return ":" not in fingerprint
+    return fingerprint.startswith(f"{project_slug}:")
 
 
 class AlertLedger:
@@ -71,41 +94,134 @@ class AlertLedger:
 
     def _init_db(self) -> None:
         with self.connect() as conn:
+            self._ensure_messages_schema(conn)
+            self._ensure_incidents_schema(conn)
+
+    def _ensure_messages_schema(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(alert_messages)").fetchall()
+        if not rows:
+            self._create_messages_table(conn)
+            return
+        columns = {row["name"] for row in rows}
+        has_scoped_unique = False
+        for index in conn.execute("PRAGMA index_list(alert_messages)").fetchall():
+            if not index["unique"]:
+                continue
+            index_columns = [
+                row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})")
+            ]
+            if index_columns == ["incident_scope", "platform", "chat_id", "message_id"]:
+                has_scoped_unique = True
+                break
+        if "incident_scope" in columns and has_scoped_unique:
             conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS alert_messages (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  platform TEXT NOT NULL,
-                  chat_id TEXT NOT NULL,
-                  message_id TEXT NOT NULL,
-                  message_ts TEXT,
-                  raw_text TEXT NOT NULL,
-                  normalized_json TEXT,
-                  fingerprint TEXT NOT NULL,
-                  incident_task_id TEXT,
-                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                  UNIQUE(platform, chat_id, message_id)
-                )
-                """
+                "UPDATE alert_messages SET incident_scope=? WHERE incident_scope IS NULL",
+                (DEFAULT_INCIDENT_SCOPE,),
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS alert_incidents (
-                  incident_task_id TEXT PRIMARY KEY,
-                  fingerprint TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  severity TEXT,
-                  alarm_name TEXT,
-                  service TEXT,
-                  first_seen_at TEXT NOT NULL,
-                  last_seen_at TEXT NOT NULL,
-                  last_channel_post_at TEXT,
-                  last_channel_status TEXT,
-                  coder_task_id TEXT,
-                  pr_ref TEXT
-                )
-                """
+            return
+
+        conn.execute("ALTER TABLE alert_messages RENAME TO alert_messages_legacy")
+        self._create_messages_table(conn)
+        legacy_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(alert_messages_legacy)")
+        }
+        incident_scope_expr = (
+            "COALESCE(incident_scope, 'default')"
+            if "incident_scope" in legacy_columns
+            else "'default'"
+        )
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO alert_messages (
+              id, platform, chat_id, message_id, message_ts, raw_text, normalized_json,
+              fingerprint, incident_task_id, incident_scope, created_at
             )
+            SELECT
+              id, platform, chat_id, message_id, message_ts, raw_text, normalized_json,
+              fingerprint, incident_task_id, {incident_scope_expr}, created_at
+            FROM alert_messages_legacy
+            """
+        )
+        conn.execute("DROP TABLE alert_messages_legacy")
+
+    def _create_messages_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE alert_messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              platform TEXT NOT NULL,
+              chat_id TEXT NOT NULL,
+              message_id TEXT NOT NULL,
+              message_ts TEXT,
+              raw_text TEXT NOT NULL,
+              normalized_json TEXT,
+              fingerprint TEXT NOT NULL,
+              incident_task_id TEXT,
+              incident_scope TEXT NOT NULL DEFAULT 'default',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(incident_scope, platform, chat_id, message_id)
+            )
+            """
+        )
+
+    def _ensure_incidents_schema(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(alert_incidents)").fetchall()
+        if not rows:
+            self._create_incidents_table(conn)
+            return
+        pk_columns = [row["name"] for row in sorted(rows, key=lambda row: row["pk"]) if row["pk"]]
+        if pk_columns == ["incident_scope", "incident_task_id"]:
+            return
+
+        conn.execute("ALTER TABLE alert_incidents RENAME TO alert_incidents_legacy")
+        self._create_incidents_table(conn)
+        legacy_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(alert_incidents_legacy)")
+        }
+        copy_columns = [
+            "incident_task_id",
+            "fingerprint",
+            "status",
+            "severity",
+            "alarm_name",
+            "service",
+            "first_seen_at",
+            "last_seen_at",
+            "last_channel_post_at",
+            "last_channel_status",
+            "coder_task_id",
+            "pr_ref",
+        ]
+        selected_columns = [column for column in copy_columns if column in legacy_columns]
+        conn.execute(
+            f"""
+            INSERT INTO alert_incidents (incident_scope, {", ".join(selected_columns)})
+            SELECT 'default', {", ".join(selected_columns)} FROM alert_incidents_legacy
+            """
+        )
+        conn.execute("DROP TABLE alert_incidents_legacy")
+
+    def _create_incidents_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE alert_incidents (
+              incident_scope TEXT NOT NULL DEFAULT 'default',
+              incident_task_id TEXT NOT NULL,
+              fingerprint TEXT NOT NULL,
+              status TEXT NOT NULL,
+              severity TEXT,
+              alarm_name TEXT,
+              service TEXT,
+              first_seen_at TEXT NOT NULL,
+              last_seen_at TEXT NOT NULL,
+              last_channel_post_at TEXT,
+              last_channel_status TEXT,
+              coder_task_id TEXT,
+              pr_ref TEXT,
+              PRIMARY KEY (incident_scope, incident_task_id)
+            )
+            """
+        )
 
     def ingest_message(
         self,
@@ -115,14 +231,17 @@ class AlertLedger:
         raw_text: str,
         message_ts: datetime | None = None,
         fingerprint_namespace: str | None = None,
+        incident_scope: str | None = None,
     ) -> IngestResult:
+        incident_scope = _normalize_incident_scope(incident_scope)
         parsed = parse_alert_text(raw_text)
         fingerprint = fingerprint_alert(parsed)
         if fingerprint_namespace:
             fingerprint = f"{fingerprint_namespace}:{fingerprint}"
         normalized_json = json.dumps(asdict(parsed), sort_keys=True)
-        correlated = self.find_open_incident(fingerprint)
+        correlated = self.find_open_incident(fingerprint, incident_scope=incident_scope)
         incident_task_id = correlated.incident_task_id if correlated else None
+        correlated_scope = correlated.incident_scope if correlated else None
         with self.connect() as conn:
             try:
                 cur = conn.execute(
@@ -130,9 +249,9 @@ class AlertLedger:
                     INSERT INTO alert_messages
                     (
                       platform, chat_id, message_id, message_ts, raw_text,
-                      normalized_json, fingerprint, incident_task_id
+                      normalized_json, fingerprint, incident_task_id, incident_scope
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         platform,
@@ -143,6 +262,7 @@ class AlertLedger:
                         normalized_json,
                         fingerprint,
                         incident_task_id,
+                        incident_scope,
                     ),
                 )
                 if cur.lastrowid is None:
@@ -152,15 +272,18 @@ class AlertLedger:
             except sqlite3.IntegrityError:
                 row = conn.execute(
                     """
-                    SELECT id, incident_task_id FROM alert_messages
-                    WHERE platform=? AND chat_id=? AND message_id=?
+                    SELECT id, incident_task_id, incident_scope FROM alert_messages
+                    WHERE incident_scope=? AND platform=? AND chat_id=? AND message_id=?
                     """,
-                    (platform, chat_id, message_id),
+                    (incident_scope, platform, chat_id, message_id),
                 ).fetchone()
                 row_id = int(row["id"])
                 duplicate = True
                 incident_task_id = row["incident_task_id"]
-        return IngestResult(row_id, duplicate, fingerprint, parsed, incident_task_id)
+                correlated_scope = row["incident_scope"]
+        return IngestResult(
+            row_id, duplicate, fingerprint, parsed, incident_task_id, correlated_scope
+        )
 
     def open_incident(
         self,
@@ -169,23 +292,26 @@ class AlertLedger:
         parsed: ParsedAlert,
         status: str,
         now: datetime | None = None,
+        incident_scope: str | None = None,
     ) -> Incident:
         _validate_status(status, INCIDENT_STATUSES, "incident status")
+        incident_scope = _normalize_incident_scope(incident_scope)
         when = iso(now)
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO alert_incidents
                 (
-                  incident_task_id, fingerprint, status, severity,
+                  incident_scope, incident_task_id, fingerprint, status, severity,
                   alarm_name, service, first_seen_at, last_seen_at,
                   last_channel_post_at, last_channel_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(incident_task_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(incident_scope, incident_task_id) DO UPDATE SET
                   status=excluded.status, last_seen_at=excluded.last_seen_at
                 """,
                 (
+                    incident_scope,
                     incident_task_id,
                     fingerprint,
                     status,
@@ -200,30 +326,94 @@ class AlertLedger:
             )
             conn.execute(
                 """
-                UPDATE alert_messages
-                SET incident_task_id=?
+                UPDATE OR IGNORE alert_messages
+                SET incident_task_id=?, incident_scope=?
                 WHERE fingerprint=? AND incident_task_id IS NULL
+                  AND (incident_scope=? OR (? != ? AND incident_scope=?))
                 """,
-                (incident_task_id, fingerprint),
+                (
+                    incident_task_id,
+                    incident_scope,
+                    fingerprint,
+                    incident_scope,
+                    incident_scope,
+                    DEFAULT_INCIDENT_SCOPE,
+                    DEFAULT_INCIDENT_SCOPE,
+                ),
             )
-        return self.get_incident(incident_task_id)  # type: ignore[return-value]
+        return self.get_incident(incident_task_id, incident_scope=incident_scope)  # type: ignore[return-value]
 
-    def find_open_incident(self, fingerprint: str) -> Incident | None:
+    def find_open_incident(
+        self, fingerprint: str, incident_scope: str | None = None
+    ) -> Incident | None:
+        params: tuple[str, ...]
+        scope_clause = ""
+        if incident_scope is not None:
+            scope_clause = "AND incident_scope=?"
+            params = (fingerprint, _normalize_incident_scope(incident_scope))
+        else:
+            params = (fingerprint,)
         with self.connect() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT * FROM alert_incidents
-                WHERE fingerprint=? AND status NOT IN ('done', 'closed', 'resolved')
+                WHERE fingerprint=? {scope_clause}
+                  AND status NOT IN ('done', 'closed', 'resolved')
                 ORDER BY last_seen_at DESC LIMIT 1
                 """,
-                (fingerprint,),
+                params,
             ).fetchone()
+            if row is None and incident_scope not in {None, DEFAULT_INCIDENT_SCOPE}:
+                legacy = conn.execute(
+                    """
+                    SELECT * FROM alert_incidents
+                    WHERE fingerprint=? AND incident_scope=?
+                      AND status NOT IN ('done', 'closed', 'resolved')
+                    ORDER BY last_seen_at DESC LIMIT 1
+                    """,
+                    (fingerprint, DEFAULT_INCIDENT_SCOPE),
+                ).fetchone()
+                if legacy is not None:
+                    target_scope = _normalize_incident_scope(incident_scope)
+                    conn.execute(
+                        """
+                        UPDATE alert_incidents
+                        SET incident_scope=?
+                        WHERE incident_scope=? AND incident_task_id=?
+                        """,
+                        (target_scope, DEFAULT_INCIDENT_SCOPE, legacy["incident_task_id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE OR IGNORE alert_messages
+                        SET incident_scope=?
+                        WHERE incident_scope=? AND incident_task_id=?
+                        """,
+                        (target_scope, DEFAULT_INCIDENT_SCOPE, legacy["incident_task_id"]),
+                    )
+                    row = conn.execute(
+                        """
+                        SELECT * FROM alert_incidents
+                        WHERE incident_scope=? AND incident_task_id=?
+                        """,
+                        (target_scope, legacy["incident_task_id"]),
+                    ).fetchone()
         return _incident_from_row(row) if row else None
 
-    def get_incident(self, incident_task_id: str) -> Incident | None:
+    def get_incident(
+        self, incident_task_id: str, incident_scope: str | None = DEFAULT_INCIDENT_SCOPE
+    ) -> Incident | None:
+        params: tuple[str, ...]
+        scope_clause = ""
+        if incident_scope is not None:
+            scope_clause = "AND incident_scope=?"
+            params = (incident_task_id, _normalize_incident_scope(incident_scope))
+        else:
+            params = (incident_task_id,)
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM alert_incidents WHERE incident_task_id=?", (incident_task_id,)
+                f"SELECT * FROM alert_incidents WHERE incident_task_id=? {scope_clause}",
+                params,
             ).fetchone()
         return _incident_from_row(row) if row else None
 
@@ -235,12 +425,56 @@ class AlertLedger:
         coder_task_id: str | None = None,
         pr_ref: str | None = None,
         now: datetime | None = None,
+        incident_scope: str | None = DEFAULT_INCIDENT_SCOPE,
     ) -> None:
         _validate_status(status, INCIDENT_STATUSES, "incident status")
         if last_channel_status is not None:
             _validate_status(last_channel_status, CHANNEL_STATUSES, "channel status")
+        incident_scope = _normalize_incident_scope(incident_scope)
         when = iso(now)
         with self.connect() as conn:
+            current = conn.execute(
+                """
+                SELECT last_channel_status FROM alert_incidents
+                WHERE incident_scope=? AND incident_task_id=?
+                """,
+                (incident_scope, incident_task_id),
+            ).fetchone()
+            if current is None and incident_scope != DEFAULT_INCIDENT_SCOPE:
+                current = conn.execute(
+                    """
+                    SELECT last_channel_status, fingerprint FROM alert_incidents
+                    WHERE incident_scope=? AND incident_task_id=?
+                    """,
+                    (DEFAULT_INCIDENT_SCOPE, incident_task_id),
+                ).fetchone()
+                if current is not None:
+                    if not _fingerprint_matches_scope(str(current["fingerprint"]), incident_scope):
+                        current = None
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE alert_incidents
+                            SET incident_scope=?
+                            WHERE incident_scope=? AND incident_task_id=?
+                            """,
+                            (incident_scope, DEFAULT_INCIDENT_SCOPE, incident_task_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE OR IGNORE alert_messages
+                            SET incident_scope=?
+                            WHERE incident_scope=? AND incident_task_id=?
+                            """,
+                            (incident_scope, DEFAULT_INCIDENT_SCOPE, incident_task_id),
+                        )
+            if current is None:
+                raise ValueError(f"unknown incident_task_id: {incident_task_id}")
+            effective_channel_status = last_channel_status or current["last_channel_status"]
+            if status in CLOSED_STATUSES and effective_channel_status != "final":
+                raise ValueError(
+                    "closed incident statuses require final channel status evidence"
+                )
             cur = conn.execute(
                 """
                 UPDATE alert_incidents
@@ -249,7 +483,7 @@ class AlertLedger:
                     last_channel_status=COALESCE(?, last_channel_status),
                     coder_task_id=COALESCE(?, coder_task_id),
                     pr_ref=COALESCE(?, pr_ref)
-                WHERE incident_task_id=?
+                WHERE incident_scope=? AND incident_task_id=?
                 """,
                 (
                     status,
@@ -258,22 +492,43 @@ class AlertLedger:
                     last_channel_status,
                     coder_task_id,
                     pr_ref,
+                    incident_scope,
                     incident_task_id,
                 ),
             )
             if cur.rowcount == 0:
                 raise ValueError(f"unknown incident_task_id: {incident_task_id}")
 
-    def idempotency_seed(self, fingerprint: str, fallback_message_id: str) -> str:
+    def idempotency_seed(
+        self,
+        fingerprint: str,
+        fallback_message_id: str,
+        incident_scope: str | None = DEFAULT_INCIDENT_SCOPE,
+    ) -> str:
+        incident_scope = _normalize_incident_scope(incident_scope)
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT message_id FROM alert_messages
-                WHERE fingerprint=? AND incident_task_id IS NULL
+                SELECT id, message_id FROM alert_messages
+                WHERE fingerprint=? AND incident_scope=? AND incident_task_id IS NULL
                 ORDER BY id ASC LIMIT 1
                 """,
-                (fingerprint,),
+                (fingerprint, incident_scope),
             ).fetchone()
+            if row is None and incident_scope != DEFAULT_INCIDENT_SCOPE:
+                row = conn.execute(
+                    """
+                    SELECT id, message_id FROM alert_messages
+                    WHERE fingerprint=? AND incident_scope=? AND incident_task_id IS NULL
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (fingerprint, DEFAULT_INCIDENT_SCOPE),
+                ).fetchone()
+                if row is not None:
+                    conn.execute(
+                        "UPDATE OR IGNORE alert_messages SET incident_scope=? WHERE id=?",
+                        (incident_scope, row["id"]),
+                    )
         return str(row["message_id"]) if row else fallback_message_id
 
     def open_incidents(self) -> list[Incident]:

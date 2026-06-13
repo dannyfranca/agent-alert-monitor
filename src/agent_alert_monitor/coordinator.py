@@ -7,7 +7,12 @@ from .alert import fingerprint_alert, parse_alert_text
 from .config import AgentConfig
 from .kanban import KanbanCardRequest, KanbanClient
 from .ledger import AlertLedger, IngestResult
-from .message_templates import correlated_alert_message, intake_ack_message, recovered_message
+from .message_templates import (
+    correlated_alert_message,
+    intake_ack_message,
+    recovered_message,
+    recovery_unmatched_message,
+)
 
 RECOVERY_STATES = {"OK", "RECOVERY", "RESOLVED"}
 CoordinatorAction = Literal[
@@ -31,6 +36,7 @@ class CoordinatorResult:
     duplicate: bool
     external_side_effects: bool
     planned_card: dict[str, object] | None = None
+    incident_scope: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -88,17 +94,20 @@ class AlertCoordinator:
                 asdict(request),
             )
 
+        incident_scope = self._incident_scope()
         ingest = self.ledger.ingest_message(
             self._ledger_platform(platform),
             chat_id,
             message_id,
             raw_text,
             fingerprint_namespace=self._fingerprint_namespace(),
+            incident_scope=incident_scope,
         )
         signal = ingest.parsed.summary
         if ingest.duplicate and ingest.correlated_incident_task_id:
             task_id = ingest.correlated_incident_task_id
-            incident = self.ledger.get_incident(task_id)
+            result_scope = ingest.correlated_incident_scope or incident_scope
+            incident = self.ledger.get_incident(task_id, incident_scope=result_scope)
             if ingest.parsed.state in RECOVERY_STATES:
                 action: CoordinatorAction = (
                     "resolved"
@@ -106,15 +115,37 @@ class AlertCoordinator:
                     else "recovery_matched"
                 )
                 message = recovered_message(task_id, signal, self.config.messages.prefix)
-                return CoordinatorResult(action, task_id, message, ingest.fingerprint, True, False)
+                return CoordinatorResult(
+                    action,
+                    task_id,
+                    message,
+                    ingest.fingerprint,
+                    True,
+                    False,
+                    incident_scope=result_scope,
+                )
             if incident and incident.status in {"done", "closed", "resolved"}:
                 return CoordinatorResult(
-                    "duplicate_closed", task_id, "", ingest.fingerprint, True, False
+                    "duplicate_closed",
+                    task_id,
+                    "",
+                    ingest.fingerprint,
+                    True,
+                    False,
+                    incident_scope=result_scope,
                 )
             message = correlated_alert_message(
                 task_id or "unknown", signal, self.config.messages.prefix
             )
-            return CoordinatorResult("duplicate", task_id, message, ingest.fingerprint, True, False)
+            return CoordinatorResult(
+                "duplicate",
+                task_id,
+                message,
+                ingest.fingerprint,
+                True,
+                False,
+                incident_scope=result_scope,
+            )
 
         if ingest.correlated_incident_task_id:
             if ingest.parsed.state in RECOVERY_STATES:
@@ -128,6 +159,7 @@ class AlertCoordinator:
                     ingest.fingerprint,
                     False,
                     False,
+                    incident_scope=incident_scope,
                 )
             message = correlated_alert_message(
                 ingest.correlated_incident_task_id, signal, self.config.messages.prefix
@@ -139,14 +171,18 @@ class AlertCoordinator:
                 ingest.fingerprint,
                 False,
                 False,
+                incident_scope=incident_scope,
             )
 
         if ingest.parsed.state in RECOVERY_STATES:
+            message = recovery_unmatched_message(signal, self.config.messages.prefix)
             return CoordinatorResult(
-                "recovery_unmatched", None, "", ingest.fingerprint, False, False
+                "recovery_unmatched", None, message, ingest.fingerprint, False, False
             )
 
-        idempotency_message_id = self.ledger.idempotency_seed(ingest.fingerprint, message_id)
+        idempotency_message_id = self.ledger.idempotency_seed(
+            ingest.fingerprint, message_id, incident_scope=incident_scope
+        )
         request = self._build_card_request(
             ingest, raw_text, platform, chat_id, idempotency_message_id
         )
@@ -154,7 +190,11 @@ class AlertCoordinator:
             raise RuntimeError("live alert handling requires a Kanban client")
         incident_task_id = self.kanban_client.create_incident(request)
         self.ledger.open_incident(
-            incident_task_id, ingest.fingerprint, ingest.parsed, "investigating"
+            incident_task_id,
+            ingest.fingerprint,
+            ingest.parsed,
+            "investigating",
+            incident_scope=incident_scope,
         )
         message = intake_ack_message(
             incident_task_id, signal, self.config.messages.prefix
@@ -167,12 +207,16 @@ class AlertCoordinator:
             ingest.duplicate,
             True,
             None,
+            incident_scope=incident_scope,
         )
 
     def record_channel_delivery(self, result: CoordinatorResult, last_channel_status: str) -> None:
         if not result.incident_task_id:
             return
-        incident = self.ledger.get_incident(result.incident_task_id)
+        result_scope = result.incident_scope or self._incident_scope()
+        incident = self.ledger.get_incident(
+            result.incident_task_id, incident_scope=result_scope
+        )
         incident_status = (
             "resolved"
             if result.action in {"recovery_matched", "resolved"}
@@ -182,6 +226,7 @@ class AlertCoordinator:
             result.incident_task_id,
             status=incident_status,
             last_channel_status=last_channel_status,
+            incident_scope=result_scope,
         )
 
     def _build_card_request(
@@ -237,6 +282,18 @@ Project: {self.config.project_display_name} (`{self.config.project_slug}`)
             priority=priority,
             tenant=self.config.kanban.tenant,
             idempotency_key=f"alert-monitor:{ingest.fingerprint}:{message_id}",
+        )
+
+    def _incident_scope(self) -> str:
+        if self.config.project_slug == "default" and not self.config.hermes.kanban_board:
+            return "default"
+        board = self.config.hermes.kanban_board or "default"
+        return "|".join(
+            [
+                f"project:{self.config.project_slug}",
+                f"profile:{self.config.hermes.coordinator_profile}",
+                f"board:{board}",
+            ]
         )
 
     def _fingerprint_namespace(self) -> str | None:

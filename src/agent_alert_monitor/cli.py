@@ -94,6 +94,19 @@ def _telegram_group_key(cfg: AgentConfig) -> str:
     return cfg.telegram.bot_token or f"env:{cfg.telegram.bot_token_env}"
 
 
+def _incident_scope_for_config(cfg: AgentConfig) -> str:
+    if cfg.project_slug == "default" and not cfg.hermes.kanban_board:
+        return "default"
+    board = cfg.hermes.kanban_board or "default"
+    return "|".join(
+        [
+            f"project:{cfg.project_slug}",
+            f"profile:{cfg.hermes.coordinator_profile}",
+            f"board:{board}",
+        ]
+    )
+
+
 def _poll_once_configs(
     configs: list[AgentConfig], args: argparse.Namespace
 ) -> list[dict[str, object]]:
@@ -146,17 +159,21 @@ def _watchdog_findings_for_config(
         ledger,
         policy=policy,
         project_slug=cfg.project_slug,
+        incident_scope=_incident_scope_for_config(cfg),
         message_prefix=cfg.messages.prefix,
     )
     rows: list[dict[str, object]] = []
     for finding in findings:
         if args.send_telegram:
             send_telegram_message(cfg, finding.message)
-            incident = ledger.get_incident(finding.incident_task_id)
+            incident = ledger.get_incident(
+                finding.incident_task_id, incident_scope=finding.incident_scope
+            )
             ledger.update_incident_status(
                 finding.incident_task_id,
                 status=incident.status if incident else "investigating",
                 last_channel_status="watchdog-stalled",
+                incident_scope=finding.incident_scope,
             )
         row = dict(finding.__dict__)
         row["project"] = cfg.project_slug
@@ -199,7 +216,12 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         cfg, ledger, _coordinator = _coordinator_for_args(args, cfg_path, env)
         if ledger is None:
             raise RuntimeError("incident-update requires a ledger")
-        ledger.update_incident_status(args.incident, args.status, args.last_channel_status)
+        ledger.update_incident_status(
+            args.incident,
+            args.status,
+            args.last_channel_status,
+            incident_scope=_incident_scope_for_config(cfg),
+        )
         print(
             json.dumps(
                 {"project": cfg.project_slug, "updated": args.incident, "status": args.status},

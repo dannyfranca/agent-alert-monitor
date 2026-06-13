@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-alert-monitor"
+version = "0.1.0"
+description = "Local Telegram-to-Hermes Kanban incident coordinator for application alerts"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Danny Franca" }]
+dependencies = [
+  "PyYAML>=6.0.0",
+  "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6.0",
+  "mypy>=1.10",
+  "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+agent-alert-monitor = "agent_alert_monitor.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_alert_monitor"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

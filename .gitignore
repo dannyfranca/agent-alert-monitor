@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.venv/
+
+# Local secrets/config/state
+.env
+.env.*
+!.env.example
+config.yaml
+ledger.sqlite
+*.sqlite
+*.sqlite3
+state/
+state-*/
+.review/
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/

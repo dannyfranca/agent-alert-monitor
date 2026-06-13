@@ -1,0 +1,52 @@
+runtime:
+  state_dir: "${ALERT_MONITOR_STATE_DIR}"
+  ledger_path: "${ALERT_MONITOR_STATE_DIR}/ledger.sqlite"
+
+watchdog:
+  ack_sla_seconds: 120
+  progress_sla_seconds: 600
+  stalled_after_seconds: 900
+
+# One install can monitor several independent projects/channels. Each project has
+# its own Telegram source, Hermes profile/board routing, Kanban tenant/assignee,
+# and channel message prefix. Secrets are still referenced by env var name only.
+default_project: sample-api
+projects:
+  - slug: sample-api
+    display_name: Sample API
+    telegram:
+      bot_token_env: ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN
+      alert_chat_id: "<SAMPLE_API_ALERT_CHANNEL_ID>"
+      poll_interval_seconds: 5
+      offset_path: "${ALERT_MONITOR_STATE_DIR}/sample-api-telegram-offset.json"
+    hermes:
+      coordinator_profile: alert-coordinator
+      # Hermes Kanban board slug. The board and coordinator profile must exist before live mode.
+      kanban_board: "sample-api-incidents"
+      channel_target: "telegram:<SAMPLE_API_ALERT_CHANNEL_ID>"
+    kanban:
+      incident_assignee: debugger
+      tenant: sample-api
+      default_priority: 1000
+      critical_priority: 2000
+    messages:
+      prefix: Sample API alert monitor
+
+  - slug: worker-queue
+    display_name: Worker Queue
+    telegram:
+      bot_token_env: ALERT_MONITOR_WORKER_QUEUE_TELEGRAM_BOT_TOKEN
+      alert_chat_id: "<WORKER_QUEUE_ALERT_CHANNEL_ID>"
+      poll_interval_seconds: 10
+      offset_path: "${ALERT_MONITOR_STATE_DIR}/worker-queue-telegram-offset.json"
+    hermes:
+      coordinator_profile: worker-alert-coordinator
+      kanban_board: "worker-incidents"
+      channel_target: "telegram:<WORKER_QUEUE_ALERT_CHANNEL_ID>"
+    kanban:
+      incident_assignee: worker-debugger
+      tenant: worker-queue
+      default_priority: 900
+      critical_priority: 1900
+    messages:
+      prefix: Worker Queue alert monitor

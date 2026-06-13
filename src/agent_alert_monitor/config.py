@@ -252,6 +252,8 @@ def load_config(
     path: str | Path,
     env: Mapping[str, str] | None = None,
     project_slug: str | None = None,
+    *,
+    allow_unresolved_default_project: bool = False,
 ) -> AgentConfig:
     env_map = dict(os.environ if env is None else env)
     path = Path(path)
@@ -259,18 +261,31 @@ def load_config(
     if not isinstance(data, dict):
         raise ValueError("config root must be a mapping")
 
-    top_level_source = {key: value for key, value in data.items() if key != "projects"}
-    if project_slug is not None:
-        top_level_source.pop("default_project", None)
+    top_level_source = {
+        key: value for key, value in data.items() if key not in {"projects", "default_project"}
+    }
     top_level = _expand_env(top_level_source, env_map, strict=True)
     runtime = _runtime_config(top_level, config_dir=path.parent)
     watchdog = _watchdog_config(top_level)
     has_projects_section = data.get("projects") is not None
     entries = _project_entries(data)
-    selected_slug = project_slug or str(
-        top_level.get("default_project")
-        or _expand_env(entries[0].get("slug") or "default", env_map, strict=True)
-    )
+    if project_slug is not None:
+        selected_slug = project_slug
+    else:
+        raw_default_project = data.get("default_project")
+        try:
+            selected_slug = str(
+                _expand_env(raw_default_project, env_map, strict=True)
+                if raw_default_project is not None
+                else _expand_env(entries[0].get("slug") or "default", env_map, strict=True)
+            )
+        except ValueError:
+            if not has_projects_section or not allow_unresolved_default_project:
+                raise
+            selected_slug = str(
+                _expand_env(entries[0].get("slug") or "default", env_map, strict=True)
+            )
+
     def entry_matches_selected(item: dict[str, Any]) -> bool:
         raw_slug = item.get("slug", "default")
         try:

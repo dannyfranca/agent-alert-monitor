@@ -196,6 +196,46 @@ projects:
     assert cfg.kanban.incident_assignee == "worker-debugger"
 
 
+def test_default_project_env_placeholder_is_required_for_default_selection(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        """
+default_project: ${DEFAULT_PROJECT}
+runtime:
+  state_dir: ${ALERT_MONITOR_STATE_DIR}
+projects:
+  - slug: sample-api
+    telegram:
+      alert_chat_id: "-100111"
+    hermes:
+      coordinator_profile: sample-coordinator
+    kanban:
+      incident_assignee: sample-debugger
+  - slug: worker-queue
+    telegram:
+      alert_chat_id: "-100222"
+    hermes:
+      coordinator_profile: worker-coordinator
+    kanban:
+      incident_assignee: worker-debugger
+""".strip(),
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(
+            config_file,
+            project_slug=None,
+            env={"ALERT_MONITOR_STATE_DIR": str(tmp_path / "state")},
+        )
+    except ValueError as exc:
+        assert "DEFAULT_PROJECT" in str(exc)
+    else:
+        raise AssertionError("expected missing default project environment error")
+
+
 def test_unknown_project_selection_is_rejected(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(

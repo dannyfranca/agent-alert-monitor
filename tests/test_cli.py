@@ -111,6 +111,44 @@ runtime:
     assert incident.status == "investigating"
 
 
+def test_all_project_watchdog_does_not_require_env_driven_default_project(
+    tmp_path: Path, capsys
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    state_dir = tmp_path / "state"
+    config_file.write_text(
+        f"""
+default_project: ${{DEFAULT_PROJECT}}
+runtime:
+  state_dir: {state_dir}
+projects:
+  - slug: sample-api
+    telegram:
+      alert_chat_id: "-100111"
+    hermes:
+      coordinator_profile: sample-coordinator
+    kanban:
+      incident_assignee: sample-debugger
+  - slug: worker-queue
+    telegram:
+      alert_chat_id: "-100222"
+    hermes:
+      coordinator_profile: worker-coordinator
+    kanban:
+      incident_assignee: worker-debugger
+""".strip(),
+        encoding="utf-8",
+    )
+
+    code = main(
+        ["--config", str(config_file), "watchdog-due"],
+        env={"ALERT_MONITOR_STATE_DIR": str(state_dir)},
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
 def test_cli_synthetic_alert_dry_run_has_no_external_side_effects(tmp_path: Path, capsys) -> None:
     config_file = tmp_path / "config.yaml"
     state_dir = tmp_path / "state"

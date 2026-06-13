@@ -6,4 +6,5 @@ Type=oneshot
 UMask=0077
 WorkingDirectory=__ALERT_MONITOR_ROOT_SYSTEMD__
 EnvironmentFile=-__ALERT_MONITOR_ENV_SYSTEMD__
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=__ALERT_MONITOR_BIN_SYSTEMD__ --config __ALERT_MONITOR_CONFIG_SYSTEMD__ watchdog-due --send-telegram

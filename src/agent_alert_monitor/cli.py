@@ -84,7 +84,12 @@ def _coordinator_for_args(
 def _project_configs(
     args: argparse.Namespace, cfg_path: Path, env: Mapping[str, str] | None
 ) -> list[AgentConfig]:
-    base = load_config(cfg_path, env=env, project_slug=args.project)
+    base = load_config(
+        cfg_path,
+        env=env,
+        project_slug=args.project,
+        allow_unresolved_default_project=args.project is None,
+    )
     if args.project:
         return [base]
     return [load_config(cfg_path, env=env, project_slug=project.slug) for project in base.projects]

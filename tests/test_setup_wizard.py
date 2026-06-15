@@ -41,7 +41,12 @@ def test_interactive_setup_writes_config_env_and_prints_data_instructions(tmp_pa
 
             def json(self) -> dict[str, object]:
                 if url.endswith("/getMe"):
-                    return {"ok": True, "result": {"username": "sample_alert_bot"}}
+                    return {"ok": True, "result": {"id": 123456, "username": "sample_alert_bot"}}
+                if url.endswith("/getChatMember"):
+                    return {
+                        "ok": True,
+                        "result": {"status": "administrator", "can_post_messages": True},
+                    }
                 return {"ok": True, "result": {"id": -100111, "title": "Sample alerts"}}
 
         return Response()
@@ -183,3 +188,111 @@ def test_setup_wizard_repompts_duplicate_project_slugs(tmp_path: Path) -> None:
         "sample-api",
         "worker-queue",
     ]
+
+
+def test_setup_wizard_collects_writes_and_validates_aws_readonly_credentials(
+    tmp_path: Path,
+) -> None:
+    commands: list[Sequence[str]] = []
+    output: list[str] = []
+    aws_dir = tmp_path / "aws"
+
+    def runner(command: Sequence[str], timeout: int = 30) -> CommandResult:
+        commands.append(command)
+        if command[:2] == ["hermes", "profile"]:
+            return CommandResult(0, "alert-coordinator\ndebugger\n")
+        if command[:4] == ["hermes", "-p", "alert-coordinator", "kanban"]:
+            return CommandResult(0, "sample-api-incidents\n")
+        if command[:4] == ["hermes", "-p", "alert-coordinator", "gateway"]:
+            return CommandResult(0, "gateway running\n")
+        if command[0] == "aws":
+            return CommandResult(0, "{}\n")
+        return CommandResult(0, "ok\n")
+
+    def secret_fn(prompt: str) -> str:
+        if "AWS secret access key" in prompt:
+            return "aws-secret"
+        return "123456:telegram-token"
+
+    def telegram_get(url: str, params: dict[str, str | int] | None = None, timeout: int = 15):
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                if url.endswith("/getMe"):
+                    return {"ok": True, "result": {"id": 123456, "username": "sample_alert_bot"}}
+                if url.endswith("/getWebhookInfo"):
+                    return {"ok": True, "result": {"url": ""}}
+                if url.endswith("/getChatMember"):
+                    return {
+                        "ok": True,
+                        "result": {"status": "administrator", "can_post_messages": True},
+                    }
+                return {"ok": True, "result": {"id": -100111, "title": "Sample alerts"}}
+
+        return Response()
+
+    result = run_setup_wizard(
+        root=tmp_path,
+        input_fn=_input_from(
+            [
+                "",
+                "1",
+                "Sample API",
+                "sample-api",
+                "",
+                "-100111",
+                "alert-coordinator",
+                "sample-api-incidents",
+                "debugger",
+                "",
+                "",
+                "",
+                "",
+                "y",
+                str(aws_dir),
+                "alert-monitor-readonly",
+                "sa-east-1",
+                "AKIAREADONLY",
+                "n",
+            ],
+            [],
+        ),
+        secret_fn=secret_fn,
+        print_fn=output.append,
+        command_runner=runner,
+        telegram_get=telegram_get,
+        validate_live=True,
+        force=True,
+    )
+
+    assert result.checks_failed == 0
+    env_text = result.env_path.read_text(encoding="utf-8")
+    assert "AWS_PROFILE='alert-monitor-readonly'" in env_text
+    assert "AWS_REGION='sa-east-1'" in env_text
+    assert f"AWS_SHARED_CREDENTIALS_FILE='{aws_dir / 'credentials'}'" in env_text
+    assert f"AWS_CONFIG_FILE='{aws_dir / 'config'}'" in env_text
+
+    credentials_text = (aws_dir / "credentials").read_text(encoding="utf-8")
+    assert "[alert-monitor-readonly]" in credentials_text
+    assert "aws_access_key_id = AKIAREADONLY" in credentials_text
+    assert "aws_secret_access_key = aws-secret" in credentials_text
+    assert stat.S_IMODE((aws_dir / "credentials").stat().st_mode) == 0o600
+    assert stat.S_IMODE((aws_dir / "config").stat().st_mode) == 0o600
+
+    aws_commands = [command for command in commands if command and command[0] == "aws"]
+    assert [
+        "aws",
+        "sts",
+        "get-caller-identity",
+        "--profile",
+        "alert-monitor-readonly",
+        "--region",
+        "sa-east-1",
+    ] in aws_commands
+    assert any(command[:3] == ["aws", "cloudwatch", "describe-alarms"] for command in aws_commands)
+    assert any(command[:3] == ["aws", "logs", "describe-log-groups"] for command in aws_commands)
+    rendered = "\n".join(output)
+    assert "CloudWatch" in rendered
+    assert "AWS caller identity check passed" in rendered

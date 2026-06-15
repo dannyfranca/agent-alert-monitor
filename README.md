@@ -235,7 +235,7 @@ The wizard asks for and explains how to get:
 - Hermes coordinator profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
 - Hermes Kanban board slug: create/list with `hermes -p <coordinator-profile> kanban boards create <slug>` and `hermes -p <coordinator-profile> kanban boards list`.
 - Incident assignee/debugger profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
-- Optional AWS readonly credentials: if you answer yes, the wizard points you to `./scripts/setup-aws-readonly.sh`, which validates STS, CloudWatch, and CloudWatch Logs access.
+- Optional AWS readonly credentials: if you answer yes, the wizard prompts locally for AWS profile, region, access key id, and secret access key; writes `~/.aws`-style files with restrictive permissions; and validates STS, CloudWatch, and CloudWatch Logs access. The standalone `./scripts/setup-aws-readonly.sh` remains available if you prefer to configure AWS separately.
 
 As it goes, live mode validates what it can without committing side effects:
 
@@ -337,7 +337,21 @@ The local poller can create Kanban cards through the Hermes CLI in non-dry mode.
 
 ## Optional provider readonly credentials
 
-Use readonly credentials only. The included AWS helper script prompts locally and writes files with restrictive permissions:
+Use readonly credentials only. The main setup wizard can collect AWS credentials directly:
+
+```bash
+./scripts/setup-interactive.sh
+```
+
+When prompted for AWS setup, provide:
+
+- AWS config directory, usually `~/.aws`
+- AWS profile name: on a fresh dedicated assistant VM the wizard suggests `default` so Hermes workers can read CloudWatch credentials without extra environment propagation; if an existing default profile is present, it suggests `alert-monitor-readonly` instead.
+- AWS region, for example `sa-east-1` or `us-east-1`
+- AWS access key id for a readonly IAM user/role
+- AWS secret access key, entered hidden
+
+The wizard writes `credentials` and `config` with `0600`, exports `AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_SHARED_CREDENTIALS_FILE`, and `AWS_CONFIG_FILE` into local `.env`, then validates STS, CloudWatch, and CloudWatch Logs. The standalone helper script is also available:
 
 ```bash
 ./scripts/setup-aws-readonly.sh

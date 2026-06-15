@@ -36,12 +36,13 @@ if not credentials.has_section(profile):
     credentials.add_section(profile)
 credentials.set(profile, "aws_access_key_id", access_key)
 credentials.set(profile, "aws_secret_access_key", secret_key)
+credentials.remove_option(profile, "aws_session_token")
 with credentials_path.open("w", encoding="utf-8") as fh:
     credentials.write(fh)
 
 config = configparser.RawConfigParser()
 config.read(config_path)
-section = f"profile {profile}"
+section = "default" if profile == "default" else f"profile {profile}"
 if not config.has_section(section):
     config.add_section(section)
 config.set(section, "region", region)
@@ -57,8 +58,17 @@ PY
   printf '%s\n' "$AWS_SECRET_ACCESS_KEY"
 } | python3 "$PY_SCRIPT" "$AWS_DIR" "$PROFILE" "$AWS_REGION"
 
+export AWS_SHARED_CREDENTIALS_FILE="$AWS_DIR/credentials"
+export AWS_CONFIG_FILE="$AWS_DIR/config"
+
 printf 'Verifying readonly profile %s...\n' "$PROFILE"
-aws sts get-caller-identity --profile "$PROFILE" >/dev/null
-aws cloudwatch describe-alarms --max-items 1 --profile "$PROFILE" >/dev/null
-aws logs describe-log-groups --limit 1 --profile "$PROFILE" >/dev/null
+aws sts get-caller-identity --profile "$PROFILE" --region "$AWS_REGION" >/dev/null
+aws cloudwatch describe-alarms --max-items 1 --profile "$PROFILE" --region "$AWS_REGION" >/dev/null
+aws logs describe-log-groups --limit 1 --profile "$PROFILE" --region "$AWS_REGION" >/dev/null
 printf 'AWS readonly smoke checks passed for profile %s.\n' "$PROFILE"
+printf '\nPersist these environment values anywhere outside this script that must use a non-default/custom AWS location:\n'
+printf 'AWS_PROFILE=%q\n' "$PROFILE"
+printf 'AWS_REGION=%q\n' "$AWS_REGION"
+printf 'AWS_DEFAULT_REGION=%q\n' "$AWS_REGION"
+printf 'AWS_SHARED_CREDENTIALS_FILE=%q\n' "$AWS_SHARED_CREDENTIALS_FILE"
+printf 'AWS_CONFIG_FILE=%q\n' "$AWS_CONFIG_FILE"

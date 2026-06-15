@@ -498,8 +498,18 @@ def _collect_aws_setup(
 ) -> AwsSetup:
     print_fn("AWS readonly setup:")
     print_fn(
-        "Create or choose an IAM access key with sts:GetCallerIdentity, "
-        "CloudWatch read, and CloudWatch Logs read permissions only."
+        "Use a dedicated IAM user access key, not a root key and not an AWS SSO/role "
+        "profile. The wizard stores a static AWS access key id + secret access key "
+        "pair for the chosen profile."
+    )
+    print_fn(
+        "To create it in AWS: IAM → Policies → Create policy with the README JSON → "
+        "Users → Create user without console access → attach that policy → "
+        "Security credentials → Create access key → Command Line Interface/Other."
+    )
+    print_fn(
+        "Minimum policy: sts:GetCallerIdentity plus read-only CloudWatch alarms/metrics "
+        "and CloudWatch Logs actions only."
     )
     config_dir = Path(
         os.path.expandvars(_ask(input_fn, "AWS config directory", "~/.aws"))

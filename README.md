@@ -348,20 +348,78 @@ When prompted for AWS setup, provide:
 - AWS config directory, usually `~/.aws`
 - AWS profile name: on a fresh dedicated assistant VM the wizard suggests `default` so Hermes workers can read CloudWatch credentials without extra environment propagation; if an existing default profile is present, it suggests `alert-monitor-readonly` instead.
 - AWS region, for example `sa-east-1` or `us-east-1`
-- AWS access key id for a readonly IAM user/role
-- AWS secret access key, entered hidden
+- AWS access key id for a dedicated readonly IAM user
+- AWS secret access key for that same IAM user, entered hidden
+
+Use this credential type:
+
+- Dedicated IAM user access key pair: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`
+- No AWS root account keys
+- No console password needed
+- No AWS SSO/role profile for the wizard path; the wizard intentionally writes static profile credentials and clears stale session-token/role/SSO fields for that profile.
+
+How to create the credentials in AWS Console:
+
+1. Open **IAM → Policies → Create policy → JSON**.
+2. Paste the policy below and create it as something like `AgentAlertMonitorCloudWatchReadOnly`.
+3. Open **IAM → Users → Create user**.
+4. Name it something like `agent-alert-monitor-readonly`.
+5. Do **not** enable console access.
+6. Attach the policy from step 2 directly or through a group.
+7. Open the new user → **Security credentials → Create access key**.
+8. Choose **Command Line Interface (CLI)** or **Other** as the use case.
+9. Copy the access key id and secret once, then paste them only into the local wizard prompt.
+
+Minimum IAM policy for CloudWatch/Logs debugging:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IdentityCheck",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogsReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+The wizard validates only:
+
+- `aws sts get-caller-identity`
+- `aws cloudwatch describe-alarms`
+- `aws logs describe-log-groups`
+
+The extra metric/log read permissions are for debugger workers to inspect incidents after setup succeeds.
 
 The wizard writes `credentials` and `config` with `0600`, exports `AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_SHARED_CREDENTIALS_FILE`, and `AWS_CONFIG_FILE` into local `.env`, then validates STS, CloudWatch, and CloudWatch Logs. The standalone helper script is also available:
 
 ```bash
 ./scripts/setup-aws-readonly.sh
 ```
-
-Suggested permission families for a debugger profile:
-
-- `sts:GetCallerIdentity`
-- `cloudwatch:DescribeAlarms`, `cloudwatch:GetMetricData`, `cloudwatch:GetMetricStatistics`
-- `logs:DescribeLogGroups`, `logs:DescribeLogStreams`, `logs:FilterLogEvents`, `logs:GetLogEvents`
 
 Do not commit cloud/provider credentials or profile files.
 

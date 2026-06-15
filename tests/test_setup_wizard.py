@@ -295,4 +295,6 @@ def test_setup_wizard_collects_writes_and_validates_aws_readonly_credentials(
     assert any(command[:3] == ["aws", "logs", "describe-log-groups"] for command in aws_commands)
     rendered = "\n".join(output)
     assert "CloudWatch" in rendered
+    assert "dedicated IAM user access key" in rendered
+    assert "Create access key" in rendered
     assert "AWS caller identity check passed" in rendered

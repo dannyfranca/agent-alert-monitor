@@ -10,6 +10,27 @@ from agent_alert_monitor.cli import main
 from agent_alert_monitor.ledger import AlertLedger
 
 
+def test_cli_setup_runs_without_existing_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[Path, bool, bool]] = []
+
+    def fake_setup(*, root: Path, validate_live: bool, force: bool):
+        calls.append((root, validate_live, force))
+
+        class Result:
+            checks_failed = 0
+
+        return Result()
+
+    monkeypatch.setattr("agent_alert_monitor.setup_wizard.run_setup_wizard", fake_setup)
+
+    code = main(["setup", "--root", str(tmp_path), "--skip-live-checks", "--force"])
+
+    assert code == 0
+    assert calls == [(tmp_path, False, True)]
+
+
 def test_cli_synthetic_alert_dry_run_can_select_project(tmp_path: Path, capsys) -> None:
     config_file = tmp_path / "config.yaml"
     state_dir = tmp_path / "state"

@@ -197,7 +197,7 @@ Generic setup path:
 
    The final command should create a task on the named board without errors. Repeat the smoke-test create under `worker-alert-coordinator` for `worker-incidents` if you keep the stock worker project enabled. `hermes -p <coordinator-profile> gateway status` should show a running gateway/dispatcher before you rely on automatic worker pickup for that profile.
 
-4. Then clone and install this package, copy `config.example.yaml`, and run dry-run synthetic alerts for each project. Only switch to live mode after the dry-run JSON shows the right project title/body, assignee, tenant, and channel message; validate the Kanban board slug separately with the smoke-test `hermes kanban --board ... create` command above.
+4. Then clone/install this package and run `./scripts/setup-interactive.sh`. Use the manual `config.example.yaml` copy path only if you are not using the wizard; the wizard intentionally refuses to overwrite an existing `config.yaml` unless you pass `--force`. Only switch to live mode after every project has passed a synthetic dry-run and the Kanban board smoke test above.
 
 ## Install locally
 
@@ -205,13 +205,47 @@ Generic setup path:
 git clone https://github.com/dannyfranca/agent-alert-monitor.git agent-alert-monitor
 cd agent-alert-monitor
 ./scripts/install.sh
-cp config.example.yaml config.yaml
-install -m 600 .env.example .env
+./scripts/setup-interactive.sh
 ```
 
-The installer also pre-creates `./state` with mode `0700`; keep that restrictive mode because the ledger contains production alert metadata.
+The installer pre-creates `./state` with mode `0700`; keep that restrictive mode because the ledger contains production alert metadata. The interactive setup writes `config.yaml` and `.env` locally, with `.env` mode `0600` because it contains secrets.
 
-Edit `config.yaml` and `.env` locally. Do not commit either file.
+Edit `config.yaml` and `.env` locally if you need to adjust generated values. Do not commit either file.
+
+## Interactive setup wizard
+
+Run the guided setup from the repo root:
+
+```bash
+./scripts/setup-interactive.sh
+```
+
+Useful flags:
+
+```bash
+./scripts/setup-interactive.sh --skip-live-checks  # write files without Telegram/Hermes validation
+./scripts/setup-interactive.sh --force             # intentionally replace existing config.yaml/.env
+agent-alert-monitor setup --root .                 # same wizard after activating .venv
+```
+
+The wizard asks for and explains how to get:
+
+- Telegram listener bot token: create a dedicated bot with `@BotFather` using `/newbot`.
+- Telegram alert channel id: add the listener bot as a channel admin, post a test alert, then run the wizard's env-based `getUpdates`/cleanup snippets and copy `chat.id` without pasting the token into chat, browser history, or shell history.
+- Hermes coordinator profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
+- Hermes Kanban board slug: create/list with `hermes -p <coordinator-profile> kanban boards create <slug>` and `hermes -p <coordinator-profile> kanban boards list`.
+- Incident assignee/debugger profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
+- Optional AWS readonly credentials: if you answer yes, the wizard prompts locally for AWS profile, region, access key id, and secret access key; writes `~/.aws`-style files with restrictive permissions; and validates STS, CloudWatch, and CloudWatch Logs access. The standalone `./scripts/setup-aws-readonly.sh` remains available if you prefer to configure AWS separately.
+
+As it goes, live mode validates what it can without committing side effects:
+
+- Telegram token via `getMe`.
+- Telegram channel access via `getChat`.
+- Hermes CLI presence.
+- Coordinator profile visibility via `hermes profile list`.
+- Kanban board visibility via `hermes -p <profile> kanban boards list`.
+
+The wizard does not paste secrets into the terminal output. It stores entered tokens only in local `.env`.
 
 
 ## Multi-project configuration
@@ -303,17 +337,89 @@ The local poller can create Kanban cards through the Hermes CLI in non-dry mode.
 
 ## Optional provider readonly credentials
 
-Use readonly credentials only. The included AWS helper script prompts locally and writes files with restrictive permissions:
+Use readonly credentials only. The main setup wizard can collect AWS credentials directly:
+
+```bash
+./scripts/setup-interactive.sh
+```
+
+When prompted for AWS setup, provide:
+
+- AWS config directory, usually `~/.aws`
+- AWS profile name: on a fresh dedicated assistant VM the wizard suggests `default` so Hermes workers can read CloudWatch credentials without extra environment propagation; if an existing default profile is present, it suggests `alert-monitor-readonly` instead.
+- AWS region, for example `sa-east-1` or `us-east-1`
+- AWS access key id for a dedicated readonly IAM user
+- AWS secret access key for that same IAM user, entered hidden
+
+Use this credential type:
+
+- Dedicated IAM user access key pair: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`
+- No AWS root account keys
+- No console password needed
+- No AWS SSO/role profile for the wizard path; the wizard intentionally writes static profile credentials and clears stale session-token/role/SSO fields for that profile.
+
+How to create the credentials in AWS Console:
+
+1. Open **IAM → Policies → Create policy → JSON**.
+2. Paste the policy below and create it as something like `AgentAlertMonitorCloudWatchReadOnly`.
+3. Open **IAM → Users → Create user**.
+4. Name it something like `agent-alert-monitor-readonly`.
+5. Do **not** enable console access.
+6. Attach the policy from step 2 directly or through a group.
+7. Open the new user → **Security credentials → Create access key**.
+8. Choose **Command Line Interface (CLI)** or **Other** as the use case.
+9. Copy the access key id and secret once, then paste them only into the local wizard prompt.
+
+Minimum IAM policy for CloudWatch/Logs debugging:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IdentityCheck",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogsReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+The wizard validates only:
+
+- `aws sts get-caller-identity`
+- `aws cloudwatch describe-alarms`
+- `aws logs describe-log-groups`
+
+The extra metric/log read permissions are for debugger workers to inspect incidents after setup succeeds.
+
+The wizard writes `credentials` and `config` with `0600`, exports `AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_SHARED_CREDENTIALS_FILE`, and `AWS_CONFIG_FILE` into local `.env`, then validates STS, CloudWatch, and CloudWatch Logs. The standalone helper script is also available:
 
 ```bash
 ./scripts/setup-aws-readonly.sh
 ```
-
-Suggested permission families for a debugger profile:
-
-- `sts:GetCallerIdentity`
-- `cloudwatch:DescribeAlarms`, `cloudwatch:GetMetricData`, `cloudwatch:GetMetricStatistics`
-- `logs:DescribeLogGroups`, `logs:DescribeLogStreams`, `logs:FilterLogEvents`, `logs:GetLogEvents`
 
 Do not commit cloud/provider credentials or profile files.
 

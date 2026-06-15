@@ -17,7 +17,7 @@ from .watchdog import WatchdogPolicy, evaluate_stalled_incidents
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-alert-monitor")
-    parser.add_argument("--config", required=True, help="Path to config.yaml")
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     parser.add_argument(
         "--project",
         help=(
@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog = sub.add_parser("watchdog-due", help="Print stalled incidents as JSON")
     watchdog.add_argument("--stalled-after-seconds", type=int)
     watchdog.add_argument("--send-telegram", action="store_true", default=False)
+
+    setup = sub.add_parser("setup", help="Interactive local setup wizard")
+    setup.add_argument("--root", default=".", help="Repo/runtime root for config.yaml and .env")
+    setup.add_argument("--skip-live-checks", action="store_true")
+    setup.add_argument("--force", action="store_true", help="Overwrite existing config.yaml/.env")
 
     return parser
 
@@ -189,6 +194,16 @@ def _watchdog_findings_for_config(
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = Path(args.config)
+
+    if args.command == "setup":
+        from . import setup_wizard
+
+        setup_result = setup_wizard.run_setup_wizard(
+            root=Path(args.root),
+            validate_live=not args.skip_live_checks,
+            force=args.force,
+        )
+        return 0 if setup_result.checks_failed == 0 else 1
 
     if args.command == "synthetic-alert":
         cfg, _ledger, coordinator = _coordinator_for_args(args, cfg_path, env)

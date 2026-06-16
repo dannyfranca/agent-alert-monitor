@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,14 @@ class SqsMessage:
         if not isinstance(parsed, dict):
             raise ValueError("SQS message body must decode to a JSON object")
         return parsed
+
+
+class CloudAlertParseError(ValueError):
+    """Raised when a cloud alert envelope cannot be parsed safely."""
+
+
+class AlertEnvelopeParser(Protocol):
+    def parse(self, raw_sqs_message: SqsMessage) -> ParsedCloudAlert: ...
 
 
 @dataclass(frozen=True)

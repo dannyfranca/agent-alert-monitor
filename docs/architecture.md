@@ -24,3 +24,24 @@ The VM never needs an inbound webhook. Telegram is the already-public delivery s
 5. New incidents become high-priority debugger Kanban cards on the configured board/tenant.
 6. Channel receives an acknowledgement or correlation status with the configured message prefix.
 7. Watchdog emits a stalled/failure message if progress becomes silent.
+
+## Ledger v2 migration assumptions
+
+The local SQLite ledger is migrated in place when `AlertLedger` opens it. Existing Telegram
+`alert_messages` rows keep their scoped message idempotency, while legacy `alert_incidents` rows are
+copied into the v2 `alert_incidents` shape with deterministic `legacy:<digest>` incident ids and
+synthetic `legacy:<scope>:<task>:first|last` event references. Legacy incident rows keep their
+original `incident_scope`, `incident_task_id`, and `fingerprint` columns so older Telegram/watchdog
+code can continue to read and update them.
+
+Cloud/SQS intake uses the new v2 tables:
+
+- `alert_sources` records configured intake sources.
+- `alert_events` stores one raw SQS/envelope/normalized alert record per deterministic `event_id`.
+- `alert_transitions` stores one incident-action candidate per deterministic `transition_key`.
+- `alert_incidents` stores v2 incident state keyed by `incident_id`, with active CloudWatch incidents
+  uniquely constrained by `project_slug + incident_fingerprint`.
+
+The active incident uniqueness rule is intended for v2 CloudWatch/SQS incidents. Migrated Telegram
+incidents receive a legacy-scoped `project_slug` so existing multi-route Telegram incidents with the
+same fingerprint are preserved safely instead of being collapsed during migration.

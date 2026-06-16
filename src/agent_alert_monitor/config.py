@@ -22,6 +22,43 @@ class TelegramConfig:
 
 
 @dataclass(frozen=True)
+class TelegramSourceConfig:
+    name: str
+    telegram: TelegramConfig
+    type: str = "telegram"
+
+
+@dataclass(frozen=True)
+class AwsSqsSourceConfig:
+    name: str
+    queue_url_env: str
+    queue_url: str
+    region: str
+    envelope: str
+    type: str = "aws_sqs"
+    wait_time_seconds: int = 20
+    max_messages: int = 10
+    visibility_timeout_seconds: int = 300
+    delete_policy: str = "after_successful_side_effects"
+
+
+AlertSourceConfig = AwsSqsSourceConfig | TelegramSourceConfig
+
+
+@dataclass(frozen=True)
+class TelegramSinkConfig:
+    name: str
+    bot_token: str | None
+    chat_id: str
+    bot_token_env: str = "ALERT_MONITOR_TELEGRAM_BOT_TOKEN"
+    chat_id_env: str | None = None
+    type: str = "telegram"
+
+
+AlertSinkConfig = TelegramSinkConfig
+
+
+@dataclass(frozen=True)
 class HermesConfig:
     coordinator_profile: str
     kanban_board: str | None = None
@@ -34,6 +71,8 @@ class KanbanConfig:
     default_priority: int = 1000
     critical_priority: int = 2000
     tenant: str = "application"
+    coder_assignee: str | None = None
+    reviewer_assignee: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +101,19 @@ class ProjectConfig:
     hermes: HermesConfig
     kanban: KanbanConfig
     messages: MessageConfig = field(default_factory=MessageConfig)
+    environment: str | None = None
+    sources: tuple[AlertSourceConfig, ...] = ()
+    sinks: tuple[AlertSinkConfig, ...] = ()
+
+    @property
+    def telegram_source(self) -> TelegramSourceConfig | None:
+        return next(
+            (source for source in self.sources if isinstance(source, TelegramSourceConfig)), None
+        )
+
+    @property
+    def telegram_sink(self) -> TelegramSinkConfig | None:
+        return next((sink for sink in self.sinks if isinstance(sink, TelegramSinkConfig)), None)
 
 
 @dataclass(frozen=True)
@@ -160,6 +212,192 @@ def _watchdog_config(data: dict[str, Any]) -> WatchdogConfig:
     )
 
 
+def _telegram_config_from_data(
+    telegram_data: dict[str, Any],
+    *,
+    env_map: Mapping[str, str],
+    runtime: RuntimeConfig,
+    config_dir: Path,
+    slug: str,
+    legacy_default: bool,
+    strict_env: bool,
+) -> TelegramConfig:
+    token_env = str(telegram_data.get("bot_token_env", "ALERT_MONITOR_TELEGRAM_BOT_TOKEN"))
+    bot_token = str(telegram_data.get("bot_token") or env_map.get(token_env) or "")
+    alert_chat_id = str(telegram_data.get("alert_chat_id", ""))
+    if not alert_chat_id and strict_env:
+        raise ValueError(f"missing projects[{slug}].telegram.alert_chat_id")
+
+    offset_path_value = telegram_data.get("offset_path")
+    if offset_path_value:
+        offset_path = _resolve_path(offset_path_value, config_dir=config_dir)
+    elif legacy_default:
+        offset_path = runtime.state_dir / "telegram-offset.json"
+    else:
+        offset_path = runtime.state_dir / f"{slug}-telegram-offset.json"
+
+    return TelegramConfig(
+        bot_token=bot_token,
+        alert_chat_id=alert_chat_id,
+        bot_token_env=token_env,
+        poll_interval_seconds=_int_setting(
+            telegram_data, "poll_interval_seconds", 5, strict_env=strict_env
+        ),
+        offset_path=offset_path,
+    )
+
+
+def _telegram_config_from_sink(
+    sink: TelegramSinkConfig,
+    *,
+    runtime: RuntimeConfig,
+    slug: str,
+) -> TelegramConfig:
+    return TelegramConfig(
+        bot_token=sink.bot_token,
+        alert_chat_id=sink.chat_id,
+        bot_token_env=sink.bot_token_env,
+        poll_interval_seconds=5,
+        offset_path=runtime.state_dir / f"{slug}-telegram-offset.json",
+    )
+
+
+def _parse_sources(
+    project_data: dict[str, Any],
+    *,
+    env_map: Mapping[str, str],
+    slug: str,
+    legacy_telegram: TelegramConfig | None,
+    strict_env: bool,
+) -> tuple[AlertSourceConfig, ...]:
+    sources_data = project_data.get("sources")
+    if sources_data is None:
+        if legacy_telegram is None:
+            return ()
+        return (TelegramSourceConfig(name=f"{slug}-telegram", telegram=legacy_telegram),)
+    if not isinstance(sources_data, list):
+        raise ValueError(f"projects[{slug}].sources must be a list")
+
+    sources: list[AlertSourceConfig] = []
+    for index, source_data in enumerate(sources_data):
+        if not isinstance(source_data, dict):
+            raise ValueError(f"projects[{slug}].sources[{index}] must be a mapping")
+        source_type = str(source_data.get("type", "")).strip()
+        name = str(source_data.get("name") or f"{slug}-{source_type or 'source'}-{index + 1}")
+        if source_type == "aws_sqs":
+            queue_url_env = str(source_data.get("queue_url_env", ""))
+            queue_url = str(source_data.get("queue_url") or env_map.get(queue_url_env, ""))
+            region = str(source_data.get("region", ""))
+            envelope = str(source_data.get("envelope", ""))
+            if strict_env:
+                if not queue_url_env and not queue_url:
+                    raise ValueError(f"projects[{slug}].sources[{index}].queue_url_env is required")
+                if not queue_url:
+                    raise ValueError(
+                        "missing queue URL environment variable for "
+                        f"projects[{slug}].sources[{index}]: {queue_url_env}"
+                    )
+                if not region:
+                    raise ValueError(f"projects[{slug}].sources[{index}].region is required")
+                if envelope not in {
+                    "aws_sns_cloudwatch_alarm",
+                    "aws_eventbridge_cloudwatch_alarm",
+                }:
+                    raise ValueError(
+                        f"projects[{slug}].sources[{index}].envelope must be "
+                        "aws_sns_cloudwatch_alarm or aws_eventbridge_cloudwatch_alarm"
+                    )
+            sources.append(
+                AwsSqsSourceConfig(
+                    name=name,
+                    queue_url_env=queue_url_env,
+                    queue_url=queue_url,
+                    region=region,
+                    envelope=envelope,
+                    wait_time_seconds=_int_setting(
+                        source_data, "wait_time_seconds", 20, strict_env=strict_env
+                    ),
+                    max_messages=_int_setting(
+                        source_data, "max_messages", 10, strict_env=strict_env
+                    ),
+                    visibility_timeout_seconds=_int_setting(
+                        source_data, "visibility_timeout_seconds", 300, strict_env=strict_env
+                    ),
+                    delete_policy=str(
+                        source_data.get("delete_policy", "after_successful_side_effects")
+                    ),
+                )
+            )
+        elif source_type == "telegram":
+            if legacy_telegram is None:
+                raise ValueError(
+                    f"projects[{slug}].sources[{index}] type=telegram requires "
+                    f"projects[{slug}].telegram"
+                )
+            sources.append(TelegramSourceConfig(name=name, telegram=legacy_telegram))
+        else:
+            raise ValueError(f"unsupported projects[{slug}].sources[{index}].type: {source_type}")
+    return tuple(sources)
+
+
+def _parse_sinks(
+    project_data: dict[str, Any],
+    *,
+    env_map: Mapping[str, str],
+    slug: str,
+    legacy_telegram: TelegramConfig | None,
+    strict_env: bool,
+) -> tuple[AlertSinkConfig, ...]:
+    sinks_data = project_data.get("sinks")
+    if sinks_data is None:
+        if legacy_telegram is None:
+            return ()
+        return (
+            TelegramSinkConfig(
+                name=f"{slug}-telegram",
+                bot_token=legacy_telegram.bot_token,
+                bot_token_env=legacy_telegram.bot_token_env,
+                chat_id=legacy_telegram.alert_chat_id,
+            ),
+        )
+    if not isinstance(sinks_data, list):
+        raise ValueError(f"projects[{slug}].sinks must be a list")
+
+    sinks: list[AlertSinkConfig] = []
+    for index, sink_data in enumerate(sinks_data):
+        if not isinstance(sink_data, dict):
+            raise ValueError(f"projects[{slug}].sinks[{index}] must be a mapping")
+        sink_type = str(sink_data.get("type", "")).strip()
+        name = str(sink_data.get("name") or f"{slug}-{sink_type or 'sink'}-{index + 1}")
+        if sink_type != "telegram":
+            raise ValueError(f"unsupported projects[{slug}].sinks[{index}].type: {sink_type}")
+        token_env = str(sink_data.get("bot_token_env", "ALERT_MONITOR_TELEGRAM_BOT_TOKEN"))
+        bot_token = str(sink_data.get("bot_token") or env_map.get(token_env) or "")
+        chat_id_env = sink_data.get("chat_id_env")
+        chat_id_env_str = str(chat_id_env) if chat_id_env else None
+        chat_id = str(
+            sink_data.get("chat_id")
+            or (env_map.get(chat_id_env_str, "") if chat_id_env_str else "")
+        )
+        if not chat_id and strict_env:
+            if chat_id_env_str:
+                raise ValueError(
+                    f"missing chat id environment variable for projects[{slug}].sinks[{index}]: "
+                    f"{chat_id_env_str}"
+                )
+            raise ValueError(f"projects[{slug}].sinks[{index}].chat_id or chat_id_env is required")
+        sinks.append(
+            TelegramSinkConfig(
+                name=name,
+                bot_token=bot_token,
+                bot_token_env=token_env,
+                chat_id=chat_id,
+                chat_id_env=chat_id_env_str,
+            )
+        )
+    return tuple(sinks)
+
+
 def _parse_project(
     project_data: dict[str, Any],
     *,
@@ -175,36 +413,58 @@ def _parse_project(
         raise ValueError("project slug is required")
     display_name = str(project_data.get("display_name") or slug).strip()
 
-    telegram_data = _required_section(project_data, "telegram")
+    telegram_section = project_data.get("telegram")
+    if telegram_section is not None and not isinstance(telegram_section, dict):
+        raise ValueError(f"config section must be a mapping: projects[{slug}].telegram")
+    legacy_telegram = (
+        _telegram_config_from_data(
+            telegram_section,
+            env_map=env_map,
+            runtime=runtime,
+            config_dir=config_dir,
+            slug=slug,
+            legacy_default=legacy_default,
+            strict_env=strict_env,
+        )
+        if telegram_section is not None
+        else None
+    )
+
     hermes_data = _required_section(project_data, "hermes")
     kanban_data = _required_section(project_data, "kanban")
     messages_data = _optional_section(project_data, "messages")
-
-    token_env = str(telegram_data.get("bot_token_env", "ALERT_MONITOR_TELEGRAM_BOT_TOKEN"))
-    bot_token = str(telegram_data.get("bot_token") or env_map.get(token_env) or "")
-    alert_chat_id = str(telegram_data.get("alert_chat_id", ""))
-    if not alert_chat_id:
-        raise ValueError(f"missing projects[{slug}].telegram.alert_chat_id")
-
-    offset_path_value = telegram_data.get("offset_path")
-    if offset_path_value:
-        offset_path = _resolve_path(offset_path_value, config_dir=config_dir)
-    elif legacy_default:
-        offset_path = runtime.state_dir / "telegram-offset.json"
-    else:
-        offset_path = runtime.state_dir / f"{slug}-telegram-offset.json"
+    sources = _parse_sources(
+        project_data,
+        env_map=env_map,
+        slug=slug,
+        legacy_telegram=legacy_telegram,
+        strict_env=strict_env,
+    )
+    sinks = _parse_sinks(
+        project_data,
+        env_map=env_map,
+        slug=slug,
+        legacy_telegram=legacy_telegram,
+        strict_env=strict_env,
+    )
+    if legacy_telegram is None and not sources and strict_env:
+        raise ValueError(f"projects[{slug}] requires telegram config or explicit sources")
+    explicit_sinks = project_data.get("sinks") is not None
+    telegram = (
+        _telegram_config_from_sink(sinks[0], runtime=runtime, slug=slug)
+        if explicit_sinks and sinks
+        else legacy_telegram
+    )
 
     return ProjectConfig(
         slug=slug,
         display_name=display_name,
-        telegram=TelegramConfig(
-            bot_token=bot_token,
-            alert_chat_id=alert_chat_id,
-            bot_token_env=token_env,
-            poll_interval_seconds=_int_setting(
-                telegram_data, "poll_interval_seconds", 5, strict_env=strict_env
-            ),
-            offset_path=offset_path,
+        environment=project_data.get("environment"),
+        telegram=telegram
+        or TelegramConfig(
+            bot_token=None,
+            alert_chat_id="",
+            offset_path=runtime.state_dir / f"{slug}-telegram-offset.json",
         ),
         hermes=HermesConfig(
             coordinator_profile=str(hermes_data.get("coordinator_profile", "alert-coordinator")),
@@ -220,8 +480,12 @@ def _parse_project(
                 kanban_data, "critical_priority", 2000, strict_env=strict_env
             ),
             tenant=str(kanban_data.get("tenant", slug if not legacy_default else "application")),
+            coder_assignee=kanban_data.get("coder_assignee"),
+            reviewer_assignee=kanban_data.get("reviewer_assignee"),
         ),
         messages=MessageConfig(prefix=str(messages_data.get("prefix", "Alert monitor"))),
+        sources=sources,
+        sinks=sinks,
     )
 
 

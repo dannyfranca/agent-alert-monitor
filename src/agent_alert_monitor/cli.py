@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from .config import AgentConfig, load_config
+from .config import AgentConfig, AwsSqsSourceConfig, load_config
 from .coordinator import AlertCoordinator
 from .kanban import HermesKanbanCliClient
 from .ledger import AlertLedger
@@ -46,6 +46,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     listen = sub.add_parser("listen", help="Continuously poll Telegram for alert channel posts")
     listen.add_argument("--dry-run", action="store_true", default=False)
+
+    sqs_peek = sub.add_parser("sqs-peek", help="Receive and parse SQS alerts without deleting")
+    sqs_peek.add_argument("--source", required=True, help="Configured aws_sqs source name")
+    sqs_peek.add_argument("--max-messages", type=int, help="Override source max_messages")
+
+    sqs_ingest = sub.add_parser(
+        "sqs-ingest", help="Receive SQS alerts; live mode is not implemented yet"
+    )
+    sqs_ingest.add_argument("--source", required=True, help="Configured aws_sqs source name")
+    sqs_ingest.add_argument("--dry-run", action="store_true", default=False)
 
     incident = sub.add_parser("incident-update", help="Update local incident status in the ledger")
     incident.add_argument("--incident", required=True)
@@ -183,6 +193,148 @@ def _telegram_intake_project_configs(
         if _project_entry_has_telegram_source(project)
     ]
     return [load_config(cfg_path, env=env, project_slug=slug) for slug in slugs]
+
+
+def _project_entry_has_sqs_source(
+    project: object, source_name: str, env: Mapping[str, str] | None
+) -> bool:
+    return _project_entry_sqs_source(project, source_name, env) is not None
+
+
+def _project_entry_sqs_source(
+    project: object, source_name: str, env: Mapping[str, str] | None
+) -> dict[str, object] | None:
+    if not isinstance(project, dict):
+        return None
+    slug = _project_entry_slug(project, env)
+    sources = project.get("sources")
+    if not isinstance(sources, list):
+        return None
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            raise ValueError("projects[].sources[] must be a mapping")
+        source_type = str(source.get("type", "")).strip()
+        generated_name = f"{slug}-{source_type or 'source'}-{index + 1}"
+        parsed_name = (
+            _expand_raw_slug(source["name"], env) if "name" in source else generated_name
+        )
+        if source_type == "aws_sqs" and parsed_name == source_name:
+            return source
+    return None
+
+
+def _env_refs(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {match.group(1) for match in _ENV_PATTERN.finditer(value)}
+    if isinstance(value, dict):
+        refs: set[str] = set()
+        for item in value.values():
+            refs.update(_env_refs(item))
+        return refs
+    if isinstance(value, list):
+        refs = set()
+        for item in value:
+            refs.update(_env_refs(item))
+        return refs
+    return set()
+
+
+def _named_env_refs(value: object) -> set[str]:
+    if isinstance(value, dict):
+        refs: set[str] = set()
+        for key, item in value.items():
+            if (
+                str(key).endswith("_env")
+                and isinstance(item, str)
+                and not _ENV_PATTERN.search(item)
+            ):
+                refs.add(item)
+            refs.update(_named_env_refs(item))
+        return refs
+    if isinstance(value, list):
+        refs = set()
+        for item in value:
+            refs.update(_named_env_refs(item))
+        return refs
+    return set()
+
+
+def _env_for_sqs_source_load(
+    project: object,
+    source_name: str,
+    env: Mapping[str, str] | None,
+    *,
+    max_messages_override: int | None = None,
+) -> Mapping[str, str] | None:
+    selected_source = _project_entry_sqs_source(project, source_name, env)
+    if selected_source is None:
+        return env
+    env_map = dict(os.environ if env is None else env)
+    selected_source_refs = _env_refs(selected_source) | _named_env_refs(selected_source)
+    project_refs = _env_refs(project) | _named_env_refs(project)
+    for name in project_refs - selected_source_refs:
+        if not env_map.get(name):
+            env_map[name] = "0"
+    if max_messages_override is not None:
+        for name in _env_refs(selected_source.get("max_messages")):
+            env_map[name] = str(max_messages_override)
+    return env_map
+
+
+def _sqs_source_project_config(
+    args: argparse.Namespace, cfg_path: Path, env: Mapping[str, str] | None
+) -> AgentConfig:
+    data = _raw_config_data(cfg_path)
+    projects = data.get("projects")
+    if args.project:
+        selected_project = None
+        if isinstance(projects, list):
+            selected_project = next(
+                (
+                    project
+                    for project in projects
+                    if isinstance(project, dict)
+                    and _project_entry_slug(project, env) == args.project
+                ),
+                None,
+            )
+        load_env = _env_for_sqs_source_load(
+            selected_project,
+            args.source,
+            env,
+            max_messages_override=getattr(args, "max_messages", None),
+        )
+        cfg = load_config(cfg_path, env=load_env, project_slug=args.project)
+        if any(
+            isinstance(source, AwsSqsSourceConfig) and source.name == args.source
+            for source in cfg.project.sources
+        ):
+            return cfg
+        raise ValueError(f"unknown aws_sqs source for project {args.project}: {args.source}")
+
+    if projects is None:
+        return load_config(cfg_path, env=env)
+    if not isinstance(projects, list):
+        raise ValueError("projects must be a non-empty list")
+    matching_projects = [
+        (_project_entry_slug(project, env), project)
+        for project in projects
+        if _project_entry_has_sqs_source(project, args.source, env)
+    ]
+    if not matching_projects:
+        raise ValueError(f"unknown aws_sqs source: {args.source}")
+    if len(matching_projects) > 1:
+        raise ValueError(
+            f"aws_sqs source name is ambiguous: {args.source}; pass --project"
+        )
+    selected_slug, selected_project = matching_projects[0]
+    load_env = _env_for_sqs_source_load(
+        selected_project,
+        args.source,
+        env,
+        max_messages_override=getattr(args, "max_messages", None),
+    )
+    return load_config(cfg_path, env=load_env, project_slug=selected_slug)
 
 
 def _telegram_group_key(cfg: AgentConfig) -> str:
@@ -325,6 +477,19 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
             poll_forever(cfg, coordinator, dry_run=args.dry_run)
         else:
             _poll_forever_many(configs, args)
+        return 0
+
+    if args.command in {"sqs-peek", "sqs-ingest"}:
+        from .sqs_ingest import receive_and_parse_sqs_messages
+
+        cfg = _sqs_source_project_config(args, cfg_path, env)
+        sqs_result = receive_and_parse_sqs_messages(
+            cfg,
+            source_name=args.source,
+            max_messages=getattr(args, "max_messages", None),
+            dry_run=True if args.command == "sqs-peek" else args.dry_run,
+        )
+        print(json.dumps(sqs_result, indent=2, sort_keys=True))
         return 0
 
     if args.command == "incident-update":

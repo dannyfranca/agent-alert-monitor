@@ -1,0 +1,14 @@
+{
+  "Messages": [
+    {
+      "Attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1781613301000"
+      },
+      "Body": "{\"Type\":\"Notification\",\"MessageId\":\"sns-message-alarm-1\",\"TopicArn\":\"arn:aws:sns:sa-east-1:123456789012:ticketdovale-prod-alerts\",\"Subject\":\"ALARM: payment-processor-prod-lambda-errors-alarm\",\"Message\":\"{\\\"AlarmName\\\":\\\"payment-processor-prod-lambda-errors-alarm\\\",\\\"AlarmDescription\\\":\\\"Errors detected for payment processor lambda\\\",\\\"AWSAccountId\\\":\\\"123456789012\\\",\\\"NewStateValue\\\":\\\"ALARM\\\",\\\"NewStateReason\\\":\\\"Threshold Crossed: 1 datapoint was greater than or equal to the threshold.\\\",\\\"StateChangeTime\\\":\\\"2026-06-16T12:34:56Z\\\",\\\"Region\\\":\\\"South America (Sao Paulo)\\\",\\\"AlarmArn\\\":\\\"arn:aws:cloudwatch:sa-east-1:123456789012:alarm:payment-processor-prod-lambda-errors-alarm\\\",\\\"OldStateValue\\\":\\\"OK\\\",\\\"Trigger\\\":{\\\"MetricName\\\":\\\"Errors\\\",\\\"Namespace\\\":\\\"AWS/Lambda\\\",\\\"StatisticType\\\":\\\"Statistic\\\",\\\"Statistic\\\":\\\"SUM\\\",\\\"Unit\\\":null,\\\"Dimensions\\\":[{\\\"name\\\":\\\"FunctionName\\\",\\\"value\\\":\\\"payment-processor-prod-lambda\\\"}],\\\"Period\\\":60,\\\"EvaluationPeriods\\\":1,\\\"ComparisonOperator\\\":\\\"GreaterThanOrEqualToThreshold\\\",\\\"Threshold\\\":1.0},\\\"NewStateReasonData\\\":\\\"{\\\\\\\"version\\\\\\\":\\\\\\\"1.0\\\\\\\",\\\\\\\"queryDate\\\\\\\":\\\\\\\"2026-06-16T12:34:56.000+0000\\\\\\\",\\\\\\\"startDate\\\\\\\":\\\\\\\"2026-06-16T12:29:00.000+0000\\\\\\\",\\\\\\\"statistic\\\\\\\":\\\\\\\"Sum\\\\\\\",\\\\\\\"period\\\\\\\":60,\\\\\\\"recentDatapoints\\\\\\\":[2.0],\\\\\\\"threshold\\\\\\\":1.0}\\\"}\",\"Timestamp\":\"2026-06-16T12:35:01.000Z\",\"SignatureVersion\":\"1\",\"Signature\":\"SANITIZED_SIGNATURE\",\"SigningCertURL\":\"https://sns.sa-east-1.amazonaws.com/SimpleNotificationService-sanitized.pem\",\"UnsubscribeURL\":\"https://sns.sa-east-1.amazonaws.com/?Action=Unsubscribe&SubscriptionArn=sanitized\"}",
+      "MessageAttributes": {},
+      "MessageId": "sqs-sns-delivery-1",
+      "ReceiptHandle": "sanitized-receipt-handle"
+    }
+  ]
+}

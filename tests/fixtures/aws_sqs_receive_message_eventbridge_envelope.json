@@ -1,0 +1,14 @@
+{
+  "Messages": [
+    {
+      "Attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1781613301000"
+      },
+      "Body": "{\"version\":\"0\",\"id\":\"eventbridge-alarm-1\",\"detail-type\":\"CloudWatch Alarm State Change\",\"source\":\"aws.cloudwatch\",\"account\":\"123456789012\",\"time\":\"2026-06-16T12:34:56Z\",\"region\":\"sa-east-1\",\"resources\":[\"arn:aws:cloudwatch:sa-east-1:123456789012:alarm:payment-processor-prod-lambda-errors-alarm\"],\"detail\":{\"alarmName\":\"payment-processor-prod-lambda-errors-alarm\",\"state\":{\"value\":\"ALARM\",\"reason\":\"Threshold Crossed: 1 datapoint was greater than or equal to the threshold.\",\"reasonData\":\"{\\\"version\\\":\\\"1.0\\\",\\\"queryDate\\\":\\\"2026-06-16T12:34:56.000+0000\\\",\\\"startDate\\\":\\\"2026-06-16T12:29:00.000+0000\\\",\\\"statistic\\\":\\\"Sum\\\",\\\"period\\\":60,\\\"recentDatapoints\\\":[2.0],\\\"threshold\\\":1.0}\",\"timestamp\":\"2026-06-16T12:34:56Z\"},\"previousState\":{\"value\":\"OK\",\"timestamp\":\"2026-06-16T12:29:56Z\"},\"configuration\":{\"description\":\"Errors detected for payment processor lambda\",\"metrics\":[{\"id\":\"m1\",\"metricStat\":{\"metric\":{\"namespace\":\"AWS/Lambda\",\"name\":\"Errors\",\"dimensions\":{\"FunctionName\":\"payment-processor-prod-lambda\"}},\"period\":60,\"stat\":\"Sum\"},\"returnData\":true}]}}}",
+      "MessageAttributes": {},
+      "MessageId": "sqs-eventbridge-delivery-1",
+      "ReceiptHandle": "sanitized-receipt-handle"
+    }
+  ]
+}

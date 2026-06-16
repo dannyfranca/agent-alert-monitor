@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -45,11 +45,17 @@ def write_offset(path: Path, offset: int) -> None:
     path.write_text(json.dumps({"offset": offset}, indent=2) + "\n", encoding="utf-8")
 
 
+def _telegram_intake_config(config: AgentConfig) -> AgentConfig:
+    source = config.project.telegram_source
+    return replace(config, telegram=source.telegram) if source is not None else config
+
+
 def poll_once(
     config: AgentConfig, coordinator: AlertCoordinator, dry_run: bool = True
 ) -> list[CoordinatorResult]:
-    _require_bot_token(config)
-    offset_path = config.telegram.offset_path
+    intake_config = _telegram_intake_config(config)
+    _require_bot_token(intake_config)
+    offset_path = intake_config.telegram.offset_path
     offset = read_offset(offset_path) if offset_path else None
     params: dict[str, str | int] = {
         "timeout": 0,
@@ -57,7 +63,7 @@ def poll_once(
     }
     if offset is not None:
         params["offset"] = offset
-    response = _telegram_get(config, "getUpdates", params=params)
+    response = _telegram_get(intake_config, "getUpdates", params=params)
     _raise_for_status(response)
     payload = response.json()
     results: list[CoordinatorResult] = []
@@ -67,7 +73,7 @@ def poll_once(
             update_id = int(item["update_id"])
             max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
     for update in _extract_channel_posts(payload):
-        if update.chat_id != config.telegram.alert_chat_id:
+        if update.chat_id != intake_config.telegram.alert_chat_id:
             continue
         try:
             result = coordinator.handle_alert(
@@ -109,12 +115,13 @@ def poll_once_many(
     """Poll one shared Telegram bot and fan out updates to matching projects."""
     if not configs:
         return []
-    config = configs[0]
+    intake_configs = [_telegram_intake_config(cfg) for cfg in configs]
+    config = intake_configs[0]
     _require_bot_token(config)
     offset_by_chat = {
-        cfg.telegram.alert_chat_id: read_offset(cfg.telegram.offset_path)
-        for cfg in configs
-        if cfg.telegram.offset_path
+        intake.telegram.alert_chat_id: read_offset(intake.telegram.offset_path)
+        for intake in intake_configs
+        if intake.telegram.offset_path
     }
     offsets = [offset for offset in offset_by_chat.values() if offset is not None]
     offset = min(offsets) if offsets else None
@@ -134,10 +141,13 @@ def poll_once_many(
             update_id = int(item["update_id"])
             max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
 
-    chat_ids = [cfg.telegram.alert_chat_id for cfg in configs]
+    chat_ids = [intake.telegram.alert_chat_id for intake in intake_configs]
     if len(set(chat_ids)) != len(chat_ids):
         raise ValueError("projects sharing one Telegram bot must use unique alert_chat_id values")
-    by_chat = {cfg.telegram.alert_chat_id: cfg for cfg in configs}
+    by_chat = {
+        intake.telegram.alert_chat_id: target
+        for intake, target in zip(intake_configs, configs, strict=True)
+    }
     results: list[tuple[str, CoordinatorResult]] = []
     for update in _extract_channel_posts(payload):
         target_config = by_chat.get(update.chat_id)
@@ -177,11 +187,11 @@ def poll_once_many(
 
     if max_update_id is not None and not dry_run:
         new_offset = max_update_id + 1
-        for cfg in configs:
-            if cfg.telegram.offset_path:
-                current_offset = offset_by_chat.get(cfg.telegram.alert_chat_id)
+        for _target, intake in zip(configs, intake_configs, strict=True):
+            if intake.telegram.offset_path:
+                current_offset = offset_by_chat.get(intake.telegram.alert_chat_id)
                 write_offset(
-                    cfg.telegram.offset_path,
+                    intake.telegram.offset_path,
                     max(new_offset, current_offset or new_offset),
                 )
     return results
@@ -190,7 +200,7 @@ def poll_once_many(
 def poll_forever(config: AgentConfig, coordinator: AlertCoordinator, dry_run: bool = False) -> None:
     while True:
         poll_once(config, coordinator, dry_run=dry_run)
-        time.sleep(config.telegram.poll_interval_seconds)
+        time.sleep(_telegram_intake_config(config).telegram.poll_interval_seconds)
 
 
 def send_telegram_message(config: AgentConfig, text: str) -> None:

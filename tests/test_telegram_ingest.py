@@ -14,6 +14,7 @@ from agent_alert_monitor.config import (
     RuntimeConfig,
     TelegramConfig,
     WatchdogConfig,
+    load_config,
 )
 from agent_alert_monitor.coordinator import AlertCoordinator
 from agent_alert_monitor.kanban import KanbanCardRequest
@@ -112,6 +113,79 @@ def test_dry_run_poll_does_not_advance_telegram_offset(tmp_path: Path, monkeypat
     assert results[0].action == "would_create_incident"
     assert config.telegram.offset_path is not None
     assert not config.telegram.offset_path.exists()
+
+
+def test_v2_telegram_source_polling_sends_ack_to_explicit_sink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        f"""
+runtime:
+  state_dir: {tmp_path}
+projects:
+  - slug: mixed
+    telegram:
+      bot_token_env: LEGACY_BOT_TOKEN
+      alert_chat_id: "-100111"
+    sources:
+      - name: mixed-telegram-legacy
+        type: telegram
+    sinks:
+      - name: mixed-telegram-status
+        type: telegram
+        bot_token_env: STATUS_BOT_TOKEN
+        chat_id: "-100222"
+    hermes:
+      coordinator_profile: alert-coordinator
+    kanban:
+      incident_assignee: debugger
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = load_config(
+        config_file,
+        env={"LEGACY_BOT_TOKEN": "legacy-token", "STATUS_BOT_TOKEN": "status-token"},
+    )
+    get_urls: list[str] = []
+    post_calls: list[tuple[str, dict[str, str]]] = []
+
+    def fake_get(url, *args, **kwargs):
+        get_urls.append(url)
+        return FakeResponse(
+            {
+                "ok": True,
+                "result": [
+                    {
+                        "update_id": 42,
+                        "channel_post": {
+                            "message_id": 7,
+                            "chat": {"id": -100111},
+                            "text": "ALARM: Service5xx service=api",
+                        },
+                    }
+                ],
+            }
+        )
+
+    def fake_post(url, *args, **kwargs):
+        post_calls.append((url, kwargs["json"]))
+        return FakeResponse({"ok": True})
+
+    monkeypatch.setattr("agent_alert_monitor.telegram_ingest.requests.get", fake_get)
+    monkeypatch.setattr("agent_alert_monitor.telegram_ingest.requests.post", fake_post)
+    coordinator = AlertCoordinator(
+        cfg,
+        ledger=AlertLedger(cfg.runtime.ledger_path),
+        kanban_client=RecordingKanbanClient(),
+    )
+
+    results = poll_once(cfg, coordinator, dry_run=False)
+
+    assert results[0].action == "created_incident"
+    assert get_urls == ["https://api.telegram.org/botlegacy-token/getUpdates"]
+    assert post_calls[0][0] == "https://api.telegram.org/botstatus-token/sendMessage"
+    assert post_calls[0][1]["chat_id"] == "-100222"
 
 
 def test_live_poll_sends_ack_before_advancing_offset(tmp_path: Path, monkeypatch) -> None:

@@ -14,16 +14,29 @@ default_project: sample-api
 projects:
   - slug: sample-api
     display_name: Sample API
-    telegram:
-      bot_token_env: ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN
-      alert_chat_id: "<SAMPLE_API_ALERT_CHANNEL_ID>"
-      poll_interval_seconds: 5
-      offset_path: "${ALERT_MONITOR_STATE_DIR}/sample-api-telegram-offset.json"
+    environment: prod
+    # v2 SQS-first alert intake. Keep Telegram as a sink/status channel; do
+    # not use Telegram as the source of truth for cloud alert records.
+    sources:
+      - name: sample-api-prod-alerts
+        type: aws_sqs
+        queue_url_env: SAMPLE_API_AGENT_ALERT_QUEUE_URL
+        region: sa-east-1
+        envelope: aws_sns_cloudwatch_alarm
+        wait_time_seconds: 20
+        max_messages: 10
+        visibility_timeout_seconds: 300
+        delete_policy: after_successful_side_effects
+    sinks:
+      - name: sample-api-telegram-status
+        type: telegram
+        bot_token_env: ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN
+        chat_id_env: ALERT_MONITOR_SAMPLE_API_TELEGRAM_CHAT_ID
     hermes:
       coordinator_profile: alert-coordinator
       # Hermes Kanban board slug. The board and coordinator profile must exist before live mode.
       kanban_board: "sample-api-incidents"
-      channel_target: "telegram:<SAMPLE_API_ALERT_CHANNEL_ID>"
+      channel_target: "telegram:${ALERT_MONITOR_SAMPLE_API_TELEGRAM_CHAT_ID}"
     kanban:
       incident_assignee: debugger
       tenant: sample-api

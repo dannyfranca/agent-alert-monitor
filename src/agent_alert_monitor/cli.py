@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+import yaml
 
 from .config import AgentConfig, load_config
 from .coordinator import AlertCoordinator
@@ -13,6 +17,8 @@ from .kanban import HermesKanbanCliClient
 from .ledger import AlertLedger
 from .telegram_ingest import poll_forever, poll_once, poll_once_many, send_telegram_message
 from .watchdog import WatchdogPolicy, evaluate_stalled_incidents
+
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,8 +106,88 @@ def _project_configs(
     return [load_config(cfg_path, env=env, project_slug=project.slug) for project in base.projects]
 
 
+def _telegram_intake_configs(configs: list[AgentConfig]) -> list[AgentConfig]:
+    return [cfg for cfg in configs if cfg.project.telegram_source is not None]
+
+
+def _raw_config_data(cfg_path: Path) -> dict[str, object]:
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError("config root must be a mapping")
+    return data
+
+
+def _project_entry_has_telegram_source(project: object) -> bool:
+    if not isinstance(project, dict):
+        return False
+    if "sources" not in project:
+        return isinstance(project.get("telegram"), dict)
+    sources = project.get("sources")
+    if not isinstance(sources, list):
+        raise ValueError("projects[].sources must be a list")
+    has_telegram = False
+    for source in sources:
+        if not isinstance(source, dict):
+            raise ValueError("projects[].sources[] must be a mapping")
+        source_type = source.get("type")
+        if source_type == "telegram":
+            has_telegram = True
+        elif source_type != "aws_sqs":
+            raise ValueError(f"unsupported projects[].sources[].type: {source_type}")
+    return has_telegram
+
+
+def _expand_raw_slug(raw_slug: object, env: Mapping[str, str] | None) -> str:
+    env_map = os.environ if env is None else env
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        return env_map.get(name, match.group(0))
+
+    return _ENV_PATTERN.sub(replace, str(raw_slug or "default"))
+
+
+def _project_entry_slug(project: dict[str, object], env: Mapping[str, str] | None) -> str:
+    return _expand_raw_slug(project.get("slug"), env)
+
+
+def _telegram_intake_project_configs(
+    args: argparse.Namespace, cfg_path: Path, env: Mapping[str, str] | None
+) -> list[AgentConfig]:
+    data = _raw_config_data(cfg_path)
+    projects = data.get("projects")
+    if projects is None:
+        if not isinstance(data.get("telegram"), dict):
+            return []
+        return _project_configs(args, cfg_path, env)
+    if not isinstance(projects, list):
+        raise ValueError("projects must be a non-empty list")
+    if args.project:
+        selected = next(
+            (
+                project
+                for project in projects
+                if isinstance(project, dict) and _project_entry_slug(project, env) == args.project
+            ),
+            None,
+        )
+        if selected is None:
+            load_config(cfg_path, env=env, project_slug=args.project)
+        if not _project_entry_has_telegram_source(selected):
+            return []
+        cfg = load_config(cfg_path, env=env, project_slug=args.project)
+        return [cfg]
+    slugs = [
+        _project_entry_slug(project, env)
+        for project in projects
+        if _project_entry_has_telegram_source(project)
+    ]
+    return [load_config(cfg_path, env=env, project_slug=slug) for slug in slugs]
+
+
 def _telegram_group_key(cfg: AgentConfig) -> str:
-    return cfg.telegram.bot_token or f"env:{cfg.telegram.bot_token_env}"
+    telegram = cfg.project.telegram_source.telegram if cfg.project.telegram_source else cfg.telegram
+    return telegram.bot_token or f"env:{telegram.bot_token_env}"
 
 
 def _incident_scope_for_config(cfg: AgentConfig) -> str:
@@ -151,7 +237,13 @@ def _poll_forever_many(configs: list[AgentConfig], args: argparse.Namespace) -> 
             poll_configs = [cfg for cfg in configs if _telegram_group_key(cfg) in due_keys]
             _poll_once_configs(poll_configs, args)
             for cfg in poll_configs:
-                next_due[cfg.project_slug] = now + cfg.telegram.poll_interval_seconds
+                source = cfg.project.telegram_source
+                interval = (
+                    source.telegram.poll_interval_seconds
+                    if source
+                    else cfg.telegram.poll_interval_seconds
+                )
+                next_due[cfg.project_slug] = now + interval
         sleep_for = max(1.0, min(next_due.values()) - time.monotonic())
         time.sleep(sleep_for)
 
@@ -218,12 +310,15 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         return 0
 
     if args.command == "ingest":
-        results = _poll_once_configs(_project_configs(args, cfg_path, env), args)
+        configs = _telegram_intake_project_configs(args, cfg_path, env)
+        results = _poll_once_configs(configs, args) if configs else []
         print(json.dumps(results, indent=2, sort_keys=True))
         return 0
 
     if args.command == "listen":
-        configs = _project_configs(args, cfg_path, env)
+        configs = _telegram_intake_project_configs(args, cfg_path, env)
+        if not configs:
+            raise ValueError("no projects with Telegram sources are configured for listen")
         if len(configs) == 1:
             cfg = configs[0]
             _ledger, coordinator = _coordinator_for_config(args, cfg)

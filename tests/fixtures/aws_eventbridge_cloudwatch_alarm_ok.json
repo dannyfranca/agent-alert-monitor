@@ -1,0 +1,45 @@
+{
+  "account": "123456789012",
+  "detail": {
+    "alarmName": "payment-processor-prod-lambda-errors-alarm",
+    "configuration": {
+      "description": "Errors detected for payment processor lambda",
+      "metrics": [
+        {
+          "id": "m1",
+          "metricStat": {
+            "metric": {
+              "dimensions": {
+                "FunctionName": "payment-processor-prod-lambda"
+              },
+              "name": "Errors",
+              "namespace": "AWS/Lambda"
+            },
+            "period": 60,
+            "stat": "Sum"
+          },
+          "returnData": true
+        }
+      ]
+    },
+    "previousState": {
+      "timestamp": "2026-06-16T12:34:56Z",
+      "value": "ALARM"
+    },
+    "state": {
+      "reason": "Threshold recovered: datapoints are below the threshold.",
+      "reasonData": "{\"version\":\"1.0\",\"queryDate\":\"2026-06-16T12:39:56.000+0000\",\"startDate\":\"2026-06-16T12:34:00.000+0000\",\"statistic\":\"Sum\",\"period\":60,\"recentDatapoints\":[0.0],\"threshold\":1.0}",
+      "timestamp": "2026-06-16T12:39:56Z",
+      "value": "OK"
+    }
+  },
+  "detail-type": "CloudWatch Alarm State Change",
+  "id": "eventbridge-ok-1",
+  "region": "sa-east-1",
+  "resources": [
+    "arn:aws:cloudwatch:sa-east-1:123456789012:alarm:payment-processor-prod-lambda-errors-alarm"
+  ],
+  "source": "aws.cloudwatch",
+  "time": "2026-06-16T12:39:56Z",
+  "version": "0"
+}

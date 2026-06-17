@@ -52,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     sqs_peek.add_argument("--max-messages", type=int, help="Override source max_messages")
 
     sqs_ingest = sub.add_parser(
-        "sqs-ingest", help="Receive SQS alerts; live mode is not implemented yet"
+        "sqs-ingest", help="Receive SQS alerts; live mode is handled by sqs-listen"
     )
     sqs_ingest.add_argument("--source", required=True, help="Configured aws_sqs source name")
     sqs_ingest.add_argument("--dry-run", action="store_true", default=False)
@@ -64,6 +64,17 @@ def build_parser() -> argparse.ArgumentParser:
     dlq_inspect = sub.add_parser("dlq-inspect", help="Inspect sanitized messages from a source DLQ")
     dlq_inspect.add_argument("--source", required=True, help="Configured aws_sqs source name")
     dlq_inspect.add_argument("--max-messages", type=int, help="Override source max_messages")
+
+    sqs_listen = sub.add_parser(
+        "sqs-listen", help="Continuously process and delete SQS alerts safely"
+    )
+    sqs_listen.add_argument("--source", required=True, help="Configured aws_sqs source name")
+    sqs_listen.add_argument(
+        "--once",
+        action="store_true",
+        default=False,
+        help="Process one ReceiveMessage batch and exit",
+    )
 
     incident = sub.add_parser("incident-update", help="Update local incident status in the ledger")
     incident.add_argument("--incident", required=True)
@@ -521,6 +532,25 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
             max_messages=getattr(args, "max_messages", None),
         )
         print(json.dumps(dlq_result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "sqs-listen":
+        from .sqs_ingest import listen_for_sqs_messages
+
+        cfg = _sqs_source_project_config(args, cfg_path, env)
+        sqs_ledger = AlertLedger(cfg.runtime.ledger_path)
+        kanban_client = HermesKanbanCliClient(
+            profile=cfg.hermes.coordinator_profile,
+            board=cfg.hermes.kanban_board,
+        )
+        sqs_result = listen_for_sqs_messages(
+            cfg,
+            source_name=args.source,
+            ledger=sqs_ledger,
+            kanban_client=kanban_client,
+            once=args.once,
+        )
+        print(json.dumps(sqs_result, indent=2, sort_keys=True))
         return 0
 
     if args.command == "incident-update":

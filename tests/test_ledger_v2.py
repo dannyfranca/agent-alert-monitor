@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from agent_alert_monitor.alert import ParsedCloudAlert, SqsMessage
+from agent_alert_monitor.alert import ParsedCloudAlert, SqsMessage, parse_alert_text
 from agent_alert_monitor.cloud_parsers import AwsSnsCloudWatchAlarmParser
 from agent_alert_monitor.ledger import AlertLedger
 
@@ -117,110 +117,44 @@ def test_ledger_v2_schema_is_created_with_idempotency_constraints(tmp_path: Path
             )
 
 
-def test_legacy_incidents_are_migrated_into_v2_shape(tmp_path: Path) -> None:
-    db = tmp_path / "ledger.sqlite"
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            """
-            CREATE TABLE alert_incidents (
-              incident_scope TEXT NOT NULL DEFAULT 'default',
-              incident_task_id TEXT NOT NULL,
-              fingerprint TEXT NOT NULL,
-              status TEXT NOT NULL,
-              severity TEXT,
-              alarm_name TEXT,
-              service TEXT,
-              first_seen_at TEXT NOT NULL,
-              last_seen_at TEXT NOT NULL,
-              last_channel_post_at TEXT,
-              last_channel_status TEXT,
-              coder_task_id TEXT,
-              pr_ref TEXT,
-              PRIMARY KEY (incident_scope, incident_task_id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO alert_incidents (
-              incident_scope, incident_task_id, fingerprint, status, severity, alarm_name,
-              service, first_seen_at, last_seen_at
-            ) VALUES (
-              'project:ticketdovale|profile:alert-coordinator|board:incidents', 't_existing',
-              'ticketdovale:legacy-fingerprint', 'investigating', 'critical', 'LegacyAlarm',
-              'payment-processor', '2026-06-16T12:00:00+00:00',
-              '2026-06-16T12:05:00+00:00'
-            )
-            """
-        )
+def test_manual_incidents_use_project_slug_from_scope(tmp_path: Path) -> None:
+    ledger = AlertLedger(tmp_path / "ledger.sqlite")
+    alert = _alert("aws_sns_cloudwatch_alarm_alarm.json")
 
-    ledger = AlertLedger(db)
-
-    incident = ledger.get_incident(
-        "t_existing",
-        incident_scope="project:ticketdovale|profile:alert-coordinator|board:incidents",
+    parsed = parse_alert_text("ALARM: Service5xx service=payment-processor region=sa-east-1")
+    incident = ledger.open_incident(
+        incident_task_id="manual_t_1",
+        fingerprint=alert.incident_fingerprint,
+        parsed=parsed,
+        status="investigating",
+        incident_scope="project:ticketdovale|source:manual",
     )
-    assert incident is not None
-    assert incident.fingerprint == "ticketdovale:legacy-fingerprint"
-    with ledger.connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM alert_incidents WHERE incident_task_id='t_existing'"
-        ).fetchone()
-    assert row["incident_id"].startswith("legacy:")
-    assert row["project_slug"].startswith("legacy:ticketdovale:")
-    assert row["incident_fingerprint"] == "ticketdovale:legacy-fingerprint"
-    assert row["first_event_id"].startswith("legacy:")
+    second = ledger.open_incident(
+        incident_task_id="manual_t_2",
+        fingerprint=alert.incident_fingerprint,
+        parsed=parsed,
+        status="investigating",
+        incident_scope="project:ticketdovale|source:manual",
+    )
 
-
-def test_legacy_duplicate_active_fingerprints_do_not_abort_migration(tmp_path: Path) -> None:
-    db = tmp_path / "ledger.sqlite"
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            """
-            CREATE TABLE alert_incidents (
-              incident_scope TEXT NOT NULL DEFAULT 'default',
-              incident_task_id TEXT NOT NULL,
-              fingerprint TEXT NOT NULL,
-              status TEXT NOT NULL,
-              severity TEXT,
-              alarm_name TEXT,
-              service TEXT,
-              first_seen_at TEXT NOT NULL,
-              last_seen_at TEXT NOT NULL,
-              PRIMARY KEY (incident_scope, incident_task_id)
-            )
-            """
-        )
-        for task_id in ("t_first", "t_second"):
-            conn.execute(
-                """
-                INSERT INTO alert_incidents (
-                  incident_scope, incident_task_id, fingerprint, status, severity, alarm_name,
-                  service, first_seen_at, last_seen_at
-                ) VALUES (
-                  'project:ticketdovale|profile:alert-coordinator|board:incidents', ?,
-                  'ticketdovale:legacy-fingerprint', 'investigating', 'critical', 'LegacyAlarm',
-                  'payment-processor', '2026-06-16T12:00:00+00:00',
-                  '2026-06-16T12:05:00+00:00'
-                )
-                """,
-                (task_id,),
-            )
-
-    ledger = AlertLedger(db)
-
+    assert incident.incident_task_id == "manual_t_1"
+    assert second.incident_task_id == "manual_t_2"
     with ledger.connect() as conn:
         rows = conn.execute(
             """
-            SELECT project_slug, incident_fingerprint, status
+            SELECT incident_id, project_slug, incident_fingerprint
             FROM alert_incidents
             ORDER BY incident_task_id
             """
         ).fetchall()
     assert len(rows) == 2
-    assert rows[0]["incident_fingerprint"] == rows[1]["incident_fingerprint"]
+    assert rows[0]["incident_id"].startswith("manual:")
+    assert rows[1]["incident_id"].startswith("manual:")
+    assert rows[0]["project_slug"].startswith("manual:ticketdovale:")
+    assert rows[1]["project_slug"].startswith("manual:ticketdovale:")
     assert rows[0]["project_slug"] != rows[1]["project_slug"]
-    assert {row["status"] for row in rows} == {"investigating"}
+    assert rows[0]["incident_fingerprint"] == alert.incident_fingerprint
+    assert rows[1]["incident_fingerprint"] == alert.incident_fingerprint
 
 
 def test_record_cloud_event_ignores_duplicate_event_id(tmp_path: Path) -> None:

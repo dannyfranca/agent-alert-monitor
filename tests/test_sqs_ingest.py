@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import types
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +13,12 @@ import pytest
 from agent_alert_monitor.cli import main
 from agent_alert_monitor.kanban import KanbanCardRequest
 from agent_alert_monitor.ledger import AlertLedger
-from agent_alert_monitor.sqs_ingest import PreflightResult, listen_for_sqs_messages
+from agent_alert_monitor.sqs_ingest import (
+    PreflightResult,
+    find_sqs_source,
+    listen_for_sqs_messages,
+    run_local_preflight,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -24,6 +33,9 @@ class FakeSqsClient:
         self.receive_calls.append(kwargs)
         return self.response
 
+    def get_queue_attributes(self, **kwargs: Any) -> dict[str, Any]:
+        return {}
+
     def delete_message(self, **kwargs: Any) -> dict[str, Any]:
         self.delete_calls.append(kwargs)
         return {}
@@ -32,6 +44,9 @@ class FakeSqsClient:
 class RaisingSqsClient:
     def receive_message(self, **kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("AccessDenied for https://sqs.example/secret-account-queue")
+
+    def get_queue_attributes(self, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("GetQueueAttributes should not run")
 
     def delete_message(self, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("DeleteMessage should not run")
@@ -59,6 +74,11 @@ class RecordingSqsClient(FakeSqsClient):
         return super().delete_message(**kwargs)
 
 
+class QueueArnMismatchSqsClient(RecordingSqsClient):
+    def get_queue_attributes(self, **kwargs: Any) -> dict[str, Any]:
+        return {"Attributes": {"QueueArn": "arn:aws:sqs:sa-east-1:123456789012:wrong-queue"}}
+
+
 class FakeKanbanClient:
     def __init__(self, *, fail_create: bool = False, fail_comment: bool = False) -> None:
         self.fail_create = fail_create
@@ -76,6 +96,86 @@ class FakeKanbanClient:
         if self.fail_comment:
             raise RuntimeError("kanban comment unavailable")
         self.comments.append((task_id, body))
+
+
+class FakeStsClient:
+    def get_caller_identity(self) -> dict[str, str]:
+        return {"Account": "123456789012"}
+
+
+def _patch_successful_preflight_processes(monkeypatch, cfg: Any) -> None:
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if command == ["/bin/hermes", "profile", "list"]:
+            stdout = "default\nalert-coordinator\n"
+        elif command == ["/bin/hermes", "-p", "alert-coordinator", "kanban", "boards", "list"]:
+            stdout = f"default\n{cfg.hermes.kanban_board}\n"
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("agent_alert_monitor.sqs_ingest.shutil.which", lambda name: "/bin/hermes")
+    monkeypatch.setattr("agent_alert_monitor.sqs_ingest.subprocess.run", fake_run)
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        types.SimpleNamespace(client=lambda *_, **__: FakeStsClient()),
+    )
+
+
+def test_local_preflight_uses_hermes_cli_profile_and_board_checks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg = _live_cfg(tmp_path)
+    source = find_sqs_source(cfg, "ticketdovale-prod-alerts")
+    ledger = AlertLedger(cfg.runtime.ledger_path)
+    client = RecordingSqsClient({"Messages": []})
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command == ["/bin/hermes", "profile", "list"]:
+            stdout = "default\nalert-coordinator\n"
+        elif command == ["/bin/hermes", "-p", "alert-coordinator", "kanban", "boards", "list"]:
+            stdout = f"default\n{cfg.hermes.kanban_board}\n"
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home-without-profile-dir"))
+    monkeypatch.setattr("agent_alert_monitor.sqs_ingest.shutil.which", lambda name: "/bin/hermes")
+    monkeypatch.setattr("agent_alert_monitor.sqs_ingest.subprocess.run", fake_run)
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        types.SimpleNamespace(client=lambda *_, **__: FakeStsClient()),
+    )
+
+    result = run_local_preflight(cfg, source, ledger, client)
+
+    assert result.ok is True
+    assert result.checks["hermes_profile"] == "ok"
+    assert result.checks["kanban_board"] == "ok"
+    assert commands == [
+        ["/bin/hermes", "profile", "list"],
+        ["/bin/hermes", "-p", "alert-coordinator", "kanban", "boards", "list"],
+    ]
+
+
+def test_local_preflight_fails_on_queue_arn_mismatch(tmp_path: Path, monkeypatch) -> None:
+    cfg = _live_cfg(tmp_path)
+    source = replace(
+        find_sqs_source(cfg, "ticketdovale-prod-alerts"),
+        queue_arn="arn:aws:sqs:sa-east-1:123456789012:expected-queue",
+    )
+    ledger = AlertLedger(cfg.runtime.ledger_path)
+    client = QueueArnMismatchSqsClient({"Messages": []})
+    _patch_successful_preflight_processes(monkeypatch, cfg)
+
+    result = run_local_preflight(cfg, source, ledger, client)
+
+    assert result.ok is False
+    assert result.checks["sqs_queue_access"] == "failed: arn_mismatch"
+    assert client.receive_calls == []
 
 
 def _live_cfg(tmp_path: Path, *, envelope: str = "aws_sns_cloudwatch_alarm"):
@@ -117,6 +217,7 @@ projects:
         chat_id: "-100111"
     hermes:
       coordinator_profile: alert-coordinator
+      kanban_board: default
     kanban:
       incident_assignee: debugger
 """.strip(),

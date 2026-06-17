@@ -6,7 +6,6 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any, Protocol
 
 from .alert import AlertEnvelopeParser, CloudAlertParseError, ParsedCloudAlert, SqsMessage
@@ -219,18 +218,29 @@ def run_local_preflight(
 
     hermes_bin = shutil.which("hermes")
     checks["hermes_binary"] = "ok" if hermes_bin else "failed"
-    profile_dir = Path.home() / ".hermes" / "profiles" / cfg.hermes.coordinator_profile
-    checks["hermes_profile"] = "ok" if profile_dir.exists() else "failed"
+    checks["hermes_profile"] = _hermes_profile_preflight_status(
+        hermes_bin, cfg.hermes.coordinator_profile
+    )
     checks["kanban_board"] = _kanban_board_preflight_status(
-        hermes_bin, cfg.hermes.coordinator_profile, cfg.hermes.kanban_board
+        hermes_bin,
+        cfg.hermes.coordinator_profile,
+        cfg.hermes.kanban_board,
+        profile_ok=checks["hermes_profile"] == "ok",
     )
 
     try:
-        client.get_queue_attributes(  # type: ignore[attr-defined]
+        attrs = client.get_queue_attributes(  # type: ignore[attr-defined]
             QueueUrl=source.queue_url,
-            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
-        )
-        checks["sqs_queue_access"] = "ok"
+            AttributeNames=[
+                "QueueArn",
+                "ApproximateNumberOfMessages",
+                "ApproximateNumberOfMessagesNotVisible",
+            ],
+        ).get("Attributes", {})
+        if source.queue_arn and _mapping_value(attrs, "QueueArn") != source.queue_arn:
+            checks["sqs_queue_access"] = "failed: arn_mismatch"
+        else:
+            checks["sqs_queue_access"] = "ok"
     except Exception:
         checks["sqs_queue_access"] = "failed"
 
@@ -263,31 +273,46 @@ def run_local_preflight(
     return PreflightResult(ok=not failed_required, checks=checks)
 
 
+def _hermes_profile_preflight_status(hermes_bin: str | None, profile: str) -> str:
+    if not hermes_bin:
+        return "failed"
+    return "ok" if _run_lists_name([hermes_bin, "profile", "list"], profile) else "failed"
+
+
 def _kanban_board_preflight_status(
-    hermes_bin: str | None, profile: str, board: str | None
+    hermes_bin: str | None,
+    profile: str,
+    board: str | None,
+    *,
+    profile_ok: bool,
 ) -> str:
-    if not hermes_bin or not board:
+    if not hermes_bin:
         return "failed"
+    if not board:
+        return "failed"
+    if not profile_ok:
+        return "failed"
+    if _run_lists_name([hermes_bin, "-p", profile, "kanban", "boards", "list"], board):
+        return "ok"
+    return "failed"
+
+
+def _run_lists_name(command: list[str], expected_name: str) -> bool:
     try:
-        subprocess.run(
-            [
-                hermes_bin,
-                "--profile",
-                profile,
-                "kanban",
-                "--board",
-                board,
-                "list",
-                "--json",
-            ],
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=20,
-        )
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
     except Exception:
-        return "failed"
-    return "ok"
+        return False
+    if result.returncode != 0:
+        return False
+    return any(_listed_name_matches(line, expected_name) for line in result.stdout.splitlines())
+
+
+def _listed_name_matches(line: str, expected_name: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    first_column = stripped.split()[0]
+    return stripped == expected_name or first_column == expected_name
 
 
 def _receive_messages(

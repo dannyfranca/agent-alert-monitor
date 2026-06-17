@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, Protocol
@@ -10,6 +11,8 @@ from .config import AgentConfig, AwsSqsSourceConfig
 
 
 class SqsClient(Protocol):
+    def get_queue_attributes(self, **kwargs: Any) -> Mapping[str, Any]: ...
+
     def receive_message(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
     def delete_message(self, **kwargs: Any) -> Mapping[str, Any]: ...
@@ -28,6 +31,9 @@ class Boto3SqsClient:
     def receive_message(self, **kwargs: Any) -> Mapping[str, Any]:
         return self._client.receive_message(**kwargs)
 
+    def get_queue_attributes(self, **kwargs: Any) -> Mapping[str, Any]:
+        return self._client.get_queue_attributes(**kwargs)
+
     def delete_message(self, **kwargs: Any) -> Mapping[str, Any]:
         return self._client.delete_message(**kwargs)
 
@@ -42,9 +48,7 @@ def find_sqs_source(cfg: AgentConfig, source_name: str) -> AwsSqsSourceConfig:
         None,
     )
     if source is None:
-        raise ValueError(
-            f"unknown aws_sqs source for project {cfg.project_slug}: {source_name}"
-        )
+        raise ValueError(f"unknown aws_sqs source for project {cfg.project_slug}: {source_name}")
     _validate_sqs_source(source, project_slug=cfg.project_slug)
     return source
 
@@ -112,6 +116,51 @@ def receive_and_parse_sqs_messages(
     }
 
 
+def inspect_dlq_messages(
+    cfg: AgentConfig,
+    *,
+    source_name: str,
+    max_messages: int | None = None,
+    client: SqsClient | None = None,
+) -> dict[str, Any]:
+    source = find_sqs_source(cfg, source_name)
+    if not source.dlq_queue_url:
+        raise ValueError(f"missing DLQ URL for source {source.name}: {source.dlq_queue_url_env}")
+    effective_max_messages = _effective_max_messages(
+        max_messages if max_messages is not None else source.max_messages
+    )
+    sqs_client = client or Boto3SqsClient(region_name=source.region)
+    try:
+        response = sqs_client.receive_message(
+            QueueUrl=source.dlq_queue_url,
+            MaxNumberOfMessages=effective_max_messages,
+            WaitTimeSeconds=0,
+            VisibilityTimeout=0,
+            AttributeNames=["ApproximateReceiveCount", "SentTimestamp"],
+            MessageAttributeNames=["All"],
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"SQS DLQ receive failed for source {source.name}: {_safe_client_error(exc)}"
+        ) from None
+    raw_messages = response.get("Messages", [])
+    if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, (str, bytes)):
+        raise ValueError("SQS ReceiveMessage returned invalid Messages payload")
+
+    parser = _parser_for_source(source, project_slug=cfg.project_slug)
+    return {
+        "project": cfg.project_slug,
+        "source": source.name,
+        "dlq_url_env": source.dlq_queue_url_env,
+        "region": source.region,
+        "envelope": source.envelope,
+        "messages_received": len(raw_messages),
+        "messages": [
+            _inspect_dlq_message(raw_message, parser=parser) for raw_message in raw_messages
+        ],
+    }
+
+
 def _effective_max_messages(value: int) -> int:
     if value < 1 or value > 10:
         raise ValueError("SQS max messages must be between 1 and 10")
@@ -143,6 +192,81 @@ def _parse_sqs_message(raw_message: object, *, parser: AlertEnvelopeParser) -> d
     except CloudAlertParseError as exc:
         return {"ok": False, "message_id": message_id, "error": str(exc)}
     return _parsed_alert_row(message_id=message_id, alert=alert)
+
+
+def _inspect_dlq_message(raw_message: object, *, parser: AlertEnvelopeParser) -> dict[str, Any]:
+    if not isinstance(raw_message, Mapping):
+        return {"ok": False, "message_id": "", "parser_error": "invalid SQS message payload"}
+    parsed = _parse_sqs_message(raw_message, parser=parser)
+    row: dict[str, Any] = {
+        "ok": bool(parsed.get("ok")),
+        "message_id": str(raw_message.get("MessageId") or ""),
+        "receive_count": _int_mapping_value(
+            raw_message.get("Attributes"), "ApproximateReceiveCount"
+        ),
+        "sent_timestamp": _optional_str(
+            _mapping_value(raw_message.get("Attributes"), "SentTimestamp")
+        ),
+        "body_summary": _body_summary(raw_message.get("Body")),
+        "message_attribute_keys": sorted(_string_mapping(raw_message.get("MessageAttributes"))),
+    }
+    if parsed.get("ok"):
+        row["event_id"] = parsed.get("event_id")
+        row["transition_key"] = parsed.get("transition_key")
+        row["incident_fingerprint"] = parsed.get("incident_fingerprint")
+    else:
+        row["parser_error"] = parsed.get("error", "parse failed")
+    return row
+
+
+def _body_summary(body: object) -> dict[str, Any]:
+    payload = _json_object(body)
+    if payload is None:
+        return {"type": "text", "keys": []}
+    summary: dict[str, Any] = {
+        "type": _safe_envelope_type(payload),
+        "keys": sorted(str(key) for key in payload),
+    }
+    inner_payload = _json_object(payload.get("Message"))
+    if inner_payload is not None:
+        summary["message_keys"] = sorted(str(key) for key in inner_payload)
+    elif isinstance(payload.get("detail"), Mapping):
+        summary["detail_keys"] = sorted(str(key) for key in payload["detail"])
+    return summary
+
+
+def _safe_envelope_type(payload: Mapping[str, Any]) -> str:
+    raw_type = payload.get("Type") or payload.get("detail-type")
+    if raw_type in {"Notification", "CloudWatch Alarm State Change"}:
+        return str(raw_type)
+    return "json"
+
+
+def _json_object(value: object) -> dict[str, Any] | None:
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items()}
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    return {str(key): item for key, item in parsed.items()}
+
+
+def _mapping_value(value: object, key: str) -> object:
+    if not isinstance(value, Mapping):
+        return None
+    return value.get(key)
+
+
+def _int_mapping_value(value: object, key: str) -> int | None:
+    raw = _mapping_value(value, key)
+    if raw is None or raw == "":
+        return None
+    return int(str(raw))
 
 
 def _parsed_alert_row(*, message_id: str, alert: ParsedCloudAlert) -> dict[str, Any]:

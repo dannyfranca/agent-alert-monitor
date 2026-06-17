@@ -57,6 +57,14 @@ def build_parser() -> argparse.ArgumentParser:
     sqs_ingest.add_argument("--source", required=True, help="Configured aws_sqs source name")
     sqs_ingest.add_argument("--dry-run", action="store_true", default=False)
 
+    health = sub.add_parser("health", help="Run local and cloud dependency checks")
+    health.add_argument("--source", required=True, help="Configured aws_sqs source name")
+    health.add_argument("--json", action="store_true", default=False, help="Print JSON output")
+
+    dlq_inspect = sub.add_parser("dlq-inspect", help="Inspect sanitized messages from a source DLQ")
+    dlq_inspect.add_argument("--source", required=True, help="Configured aws_sqs source name")
+    dlq_inspect.add_argument("--max-messages", type=int, help="Override source max_messages")
+
     incident = sub.add_parser("incident-update", help="Update local incident status in the ledger")
     incident.add_argument("--incident", required=True)
     incident.add_argument("--status", required=True)
@@ -215,9 +223,7 @@ def _project_entry_sqs_source(
             raise ValueError("projects[].sources[] must be a mapping")
         source_type = str(source.get("type", "")).strip()
         generated_name = f"{slug}-{source_type or 'source'}-{index + 1}"
-        parsed_name = (
-            _expand_raw_slug(source["name"], env) if "name" in source else generated_name
-        )
+        parsed_name = _expand_raw_slug(source["name"], env) if "name" in source else generated_name
         if source_type == "aws_sqs" and parsed_name == source_name:
             return source
     return None
@@ -324,9 +330,7 @@ def _sqs_source_project_config(
     if not matching_projects:
         raise ValueError(f"unknown aws_sqs source: {args.source}")
     if len(matching_projects) > 1:
-        raise ValueError(
-            f"aws_sqs source name is ambiguous: {args.source}; pass --project"
-        )
+        raise ValueError(f"aws_sqs source name is ambiguous: {args.source}; pass --project")
     selected_slug, selected_project = matching_projects[0]
     load_env = _env_for_sqs_source_load(
         selected_project,
@@ -490,6 +494,33 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
             dry_run=True if args.command == "sqs-peek" else args.dry_run,
         )
         print(json.dumps(sqs_result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "health":
+        from .health import build_health_report
+
+        try:
+            cfg = _sqs_source_project_config(args, cfg_path, env)
+            report = build_health_report(cfg, source_name=args.source, env=env)
+        except Exception as exc:
+            report = {
+                "ok": False,
+                "source": args.source,
+                "checks": {"config": f"failed: {exc.__class__.__name__}"},
+            }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["ok"] else 1
+
+    if args.command == "dlq-inspect":
+        from .sqs_ingest import inspect_dlq_messages
+
+        cfg = _sqs_source_project_config(args, cfg_path, env)
+        dlq_result = inspect_dlq_messages(
+            cfg,
+            source_name=args.source,
+            max_messages=getattr(args, "max_messages", None),
+        )
+        print(json.dumps(dlq_result, indent=2, sort_keys=True))
         return 0
 
     if args.command == "incident-update":

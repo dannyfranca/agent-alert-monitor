@@ -33,6 +33,10 @@ for unit in [
     "agent-alert-monitor-ingest.service",
     "agent-alert-monitor-watchdog.service",
     "agent-alert-monitor-watchdog.timer",
+    "agent-alert-monitor-sqs-readiness.service",
+    "agent-alert-monitor-sqs-listen.service",
+    "agent-alert-monitor-health.service",
+    "agent-alert-monitor-health.timer",
 ]:
     rendered = (root / "systemd" / unit).read_text(encoding="utf-8")
     for placeholder, value in replacements.items():
@@ -42,4 +46,4 @@ PY
 
 systemctl --user daemon-reload
 printf 'Installed units under %s for repo %s.\n' "$UNIT_DIR" "$ROOT"
-printf 'Next: systemctl --user enable --now agent-alert-monitor-ingest.service agent-alert-monitor-watchdog.timer\n'
+printf 'Next: systemctl --user enable --now agent-alert-monitor-sqs-readiness.service agent-alert-monitor-health.timer agent-alert-monitor-watchdog.timer\n'

@@ -21,6 +21,9 @@ projects:
       - name: sample-api-prod-alerts
         type: aws_sqs
         queue_url_env: SAMPLE_API_AGENT_ALERT_QUEUE_URL
+        queue_arn_env: SAMPLE_API_AGENT_ALERT_QUEUE_ARN
+        dlq_queue_url_env: SAMPLE_API_AGENT_ALERT_DLQ_URL
+        dlq_queue_arn_env: SAMPLE_API_AGENT_ALERT_DLQ_ARN
         region: sa-east-1
         envelope: aws_sns_cloudwatch_alarm
         wait_time_seconds: 20

@@ -1,8 +1,8 @@
 # Agent Alert Monitor
 
-Local Telegram-to-Hermes Kanban incident coordinator for configured alert channels.
+Local SQS-to-Hermes Kanban incident coordinator for configured cloud alert queues, with Telegram retained as a human-visible status sink.
 
-This project turns one or more existing Telegram alert channels into durable incident intake paths without exposing the operator's local VM and without making the monitored systems depend on Hermes. Alerts keep flowing to Telegram as they do today; this agent listens locally, records every alert in a SQLite ledger, correlates related alerts per configured project, plans or creates high-priority Kanban incident cards, and emits concise status messages so failures do not disappear silently.
+This project consumes CloudWatch/SNS/EventBridge alert payloads from a dedicated SQS queue, records every alert in a local SQLite ledger, correlates related alerts per configured project, plans or creates high-priority Kanban incident cards, and emits concise Telegram status messages so failures do not disappear silently. Telegram intake remains available only as a legacy/fallback manual path; SQS is the target source of truth for durable alert intake.
 
 Version: `0.1.0`.
 License: MIT.
@@ -10,22 +10,23 @@ License: MIT.
 ## Architecture
 
 ```text
-Alerting system / monitoring provider
-  → configured Telegram alert channel(s)
-  → local Telegram bot poller/listener
+CloudWatch alarm state changes
+  → SNS/EventBridge envelope in existing dedicated SQS queue
+  → local SQS poller / DLQ inspector
   → alert coordinator profile/session
   → durable alert ledger
   → high-priority Kanban incident cards
   → debugger profile investigates
   → coder PR card only when code fix is likely
-  → concise status messages posted back to alert channel
+  → concise Telegram status messages posted back to alert channel
 ```
 
 Core principle:
 
 ```text
-Telegram session = correlation and reasoning context
-Alert ledger = durable intake/dedupe/recovery state
+SQS queue = cloud-durable alert intake boundary
+Telegram session = human-visible status mirror and legacy/fallback manual intake
+Alert ledger = durable local dedupe/recovery state
 Kanban = execution state and multi-agent fan-out
 Watchdog = no-silence guarantee
 ```
@@ -125,6 +126,7 @@ stateDiagram-v2
 ## What is implemented in v0.1.0
 
 - Python package with CLI entry point `agent-alert-monitor`.
+- SQS dry-run commands for configured `aws_sqs` sources, including sanitized `sqs-peek`, `sqs-ingest --dry-run`, `health --source ... --json`, and `dlq-inspect --source ...` output.
 - YAML/env configuration loader with multiple project/channel definitions that keeps tokens out of committed files.
 - SQLite ledger for raw messages, fingerprints, incident mapping, idempotency, and watchdog state.
 - Alert parsing/fingerprinting with stable project-scoped dedupe across noisy metric values.
@@ -140,7 +142,9 @@ stateDiagram-v2
 - Linux host with Python 3.11+.
 - Hermes CLI installed and configured on the same host that will run this package. See the Hermes install guide: <https://hermes-agent.nousresearch.com/docs/getting-started/installation>.
 - Hermes Kanban enabled and initialized, with the board slugs and worker profiles named in `config.yaml` already created. See the Kanban guide: <https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban>.
-- Telegram listener bot token per monitored source. Each listener bot must be an admin of its alert channel so it can receive `channel_post` updates.
+- Existing dedicated SQS Standard queue and DLQ for alert intake, with queue URL/DLQ URL supplied in local environment variables.
+- Narrow AWS credentials with `sts:GetCallerIdentity`, `sqs:GetQueueAttributes`, `sqs:ReceiveMessage` for inspection, and later `sqs:DeleteMessage`/`sqs:ChangeMessageVisibility` for live consumption.
+- Telegram status bot token per monitored project. Each status bot must be able to post/read its configured status channel; Telegram intake is legacy/fallback only for SQS-first projects.
 - Optional cloud/provider CLIs configured readonly if debugger workers will inspect logs, metrics, deploys, or traces.
 - Optional: `gh` for release/tag workflows if you use GitHub.
 
@@ -429,28 +433,29 @@ Install example units for the current user:
 
 ```bash
 ./scripts/systemd-install.sh
-systemctl --user edit agent-alert-monitor-ingest.service
+systemctl --user edit agent-alert-monitor-sqs-readiness.service
+systemctl --user edit agent-alert-monitor-health.service
 systemctl --user daemon-reload
-SYSTEMD_ENV="$(systemctl --user show agent-alert-monitor-ingest.service --property=Environment --value)"
-SYSTEMD_WORKDIR="$(systemctl --user show agent-alert-monitor-ingest.service --property=WorkingDirectory --value)"
+SYSTEMD_ENV="$(systemctl --user show agent-alert-monitor-health.service --property=Environment --value)"
+SYSTEMD_WORKDIR="$(systemctl --user show agent-alert-monitor-health.service --property=WorkingDirectory --value)"
 printf "%s\n" "$SYSTEMD_ENV" | tr " " "\n" | grep "^PATH="
 systemd-run --user --wait --collect --pty \
   --property=WorkingDirectory="${SYSTEMD_WORKDIR:-$PWD}" \
   --property=Environment="$SYSTEMD_ENV" \
   /usr/bin/env sh -lc 'command -v hermes && hermes --version'
-systemctl --user enable --now agent-alert-monitor-ingest.service agent-alert-monitor-watchdog.timer
+systemctl --user enable --now agent-alert-monitor-sqs-readiness.service agent-alert-monitor-health.timer agent-alert-monitor-watchdog.timer
 ```
 
 The install script substitutes the current repo path into the unit files. Run it from the clone path you intend to operate. On headless VMs, ensure the user manager survives logout with `loginctl enable-linger <user>` if that is not already configured.
 
 The bundled units persist a service PATH of `%h/.local/bin:/usr/local/bin:/usr/bin:/bin` so non-dry live card creation can resolve a standard `hermes` install even when the user manager did not inherit your shell PATH. If `hermes` is installed somewhere else, add a user-service override that sets `Environment=PATH=...` before enabling live mode.
 
-Smoke-test the installed user service's resolved environment before enabling live mode. This reads the `Environment=` and `WorkingDirectory=` values from `agent-alert-monitor-ingest.service`, so user-service overrides for a custom Hermes install are included in the check:
+Smoke-test the installed user service's resolved environment before enabling live mode. This reads the `Environment=` and `WorkingDirectory=` values from `agent-alert-monitor-health.service`, so user-service overrides for a custom Hermes install are included in the check:
 
 ```bash
 systemctl --user daemon-reload
-SYSTEMD_ENV="$(systemctl --user show agent-alert-monitor-ingest.service --property=Environment --value)"
-SYSTEMD_WORKDIR="$(systemctl --user show agent-alert-monitor-ingest.service --property=WorkingDirectory --value)"
+SYSTEMD_ENV="$(systemctl --user show agent-alert-monitor-health.service --property=Environment --value)"
+SYSTEMD_WORKDIR="$(systemctl --user show agent-alert-monitor-health.service --property=WorkingDirectory --value)"
 printf "%s\n" "$SYSTEMD_ENV" | tr " " "\n" | grep "^PATH="
 systemd-run --user --wait --collect --pty \
   --property=WorkingDirectory="${SYSTEMD_WORKDIR:-$PWD}" \
@@ -458,7 +463,7 @@ systemd-run --user --wait --collect --pty \
   /usr/bin/env sh -lc 'command -v hermes && hermes --version'
 ```
 
-The `grep "^PATH="` line should print the PATH resolved from the installed user service, and the `command -v hermes` line should print the Hermes binary path before you rely on non-dry `listen` or `watchdog-due --send-telegram`. If you installed Hermes outside that PATH, update the service override with `systemctl --user edit agent-alert-monitor-ingest.service`, reload the user manager, and re-run this smoke test.
+The `grep "^PATH="` line should print the PATH resolved from the installed user service, and the `command -v hermes` line should print the Hermes binary path before you rely on SQS health/readiness or `watchdog-due --send-telegram`. If you installed Hermes outside that PATH, update the service override with `systemctl --user edit agent-alert-monitor-health.service`, reload the user manager, and re-run this smoke test.
 
 ## Common commands
 
@@ -469,10 +474,14 @@ python -m pytest -q
 # Lint if ruff is installed
 python -m ruff check .
 
-# Dry-run synthetic alert
+# SQS health and DLQ inspection
+agent-alert-monitor --config config.yaml health --source sample-api-prod-alerts --json
+agent-alert-monitor --config config.yaml dlq-inspect --source sample-api-prod-alerts --max-messages 10
+
+# Legacy Telegram dry-run synthetic alert
 agent-alert-monitor --config config.yaml --project sample-api synthetic-alert --text 'ALARM: Service5xx service=api' --dry-run
 
-# Poll Telegram once without creating cards
+# Legacy Telegram polling without creating cards
 agent-alert-monitor --config config.yaml ingest --dry-run  # all configured projects
 agent-alert-monitor --config config.yaml --project worker-queue ingest --dry-run
 
@@ -491,7 +500,8 @@ agent-alert-monitor --config config.yaml incident-update \
 - No secrets are committed. `.env`, `config.yaml`, local state, and SQLite ledgers are ignored.
 - `config.example.yaml` and `.env.example` contain placeholders only.
 - Telegram tokens are read from local environment variables named by each project config.
-- Cloud/provider access should be readonly and scoped to the triage surfaces debugger workers need.
+- Cloud/provider access should be readonly and scoped to SQS inspection plus the triage surfaces debugger workers need; only live intake needs `DeleteMessage` and `ChangeMessageVisibility` on the dedicated intake queue.
+- DLQ inspection output is sanitized by design: it shows message ids, parser errors, keys, and counts, not raw bodies, receipt handles, token values, or secret-looking payload values.
 - Ledger data is local operational state: raw alert text, fingerprints, incident ids, status timestamps, optional PR references. Treat it as sensitive production metadata.
 - Rotate or prune ledger state according to your incident retention needs. A simple first policy is to back up then delete resolved rows older than 90 days.
 

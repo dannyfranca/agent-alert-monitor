@@ -41,6 +41,8 @@ class Incident:
     severity: str | None
     alarm_name: str | None
     service: str | None
+    first_event_id: str
+    last_event_id: str
     first_seen_at: str
     last_seen_at: str
     last_channel_post_at: str | None
@@ -137,6 +139,8 @@ class AlertLedger:
             self._ensure_events_schema(conn)
             self._ensure_transitions_schema(conn)
             self._ensure_incidents_schema(conn)
+            self._ensure_side_effects_schema(conn)
+            self._ensure_event_incidents_schema(conn)
 
     def _ensure_sources_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -183,6 +187,31 @@ class AlertLedger:
               alarm_name TEXT,
               service TEXT,
               log_group TEXT,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _ensure_side_effects_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_side_effects (
+              event_id TEXT NOT NULL,
+              effect_name TEXT NOT NULL,
+              status TEXT NOT NULL,
+              detail_json TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (event_id, effect_name)
+            )
+            """
+        )
+
+    def _ensure_event_incidents_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_event_incidents (
+              event_id TEXT PRIMARY KEY,
+              incident_id TEXT NOT NULL,
               created_at TEXT NOT NULL
             )
             """
@@ -408,16 +437,215 @@ class AlertLedger:
                 )
             transition = self._record_alert_transition(conn, alert.event_id, alert, now)
             if transition.duplicate:
+                incident_id = _find_cloud_incident_id_for_transition(conn, alert.transition_key)
+                if incident_id is not None:
+                    self._record_alert_event_incident(conn, alert.event_id, incident_id, now)
                 return CloudAlertProcessResult(
                     alert.event_id,
                     alert.transition_key,
                     "duplicate_transition",
+                    incident_id,
                     duplicate_transition=True,
                 )
             action, incident_id = self._apply_cloud_incident_transition(conn, alert, now)
+            if incident_id is not None:
+                self._record_alert_event_incident(conn, alert.event_id, incident_id, now)
             return CloudAlertProcessResult(
                 alert.event_id, alert.transition_key, action, incident_id
             )
+
+    def record_alert_parse_failure(
+        self,
+        source_name: str,
+        project_slug: str,
+        raw_sqs_message: SqsMessage,
+        parse_error: str,
+        *,
+        received_at: datetime | None = None,
+    ) -> AlertEventWrite:
+        when = iso(received_at)
+        event_id = _parse_failure_event_id(source_name, raw_sqs_message)
+        with self.connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO alert_events (
+                      event_id, source_name, project_slug, received_at, raw_sqs_message_json,
+                      raw_envelope_json, normalized_alert_json, parse_status, parse_error
+                    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 'failed', ?)
+                    """,
+                    (
+                        event_id,
+                        source_name,
+                        project_slug,
+                        when,
+                        _json_dumps(_sqs_message_payload(raw_sqs_message)),
+                        parse_error,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return AlertEventWrite(event_id, True, "failed")
+        return AlertEventWrite(event_id, False, "failed")
+
+    def alert_side_effect_succeeded(self, event_id: str, effect_name: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM alert_side_effects
+                WHERE event_id=? AND effect_name=? AND status='succeeded'
+                """,
+                (event_id, effect_name),
+            ).fetchone()
+        return row is not None
+
+    def record_alert_side_effect(
+        self,
+        event_id: str,
+        effect_name: str,
+        status: str,
+        detail: object | None = None,
+        *,
+        updated_at: datetime | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO alert_side_effects (
+                  event_id, effect_name, status, detail_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(event_id, effect_name) DO UPDATE SET
+                  status=excluded.status,
+                  detail_json=excluded.detail_json,
+                  updated_at=excluded.updated_at
+                """,
+                (event_id, effect_name, status, _json_dumps(detail or {}), iso(updated_at)),
+            )
+
+    def _record_alert_event_incident(
+        self,
+        conn: sqlite3.Connection,
+        event_id: str,
+        incident_id: str,
+        created_at: datetime | None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO alert_event_incidents (event_id, incident_id, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET incident_id=excluded.incident_id
+            """,
+            (event_id, incident_id, iso(created_at)),
+        )
+
+    def attach_cloud_incident_kanban_task(
+        self,
+        incident_id: str,
+        kanban_task_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE alert_incidents
+                SET kanban_task_id=?, last_seen_at=?
+                WHERE incident_id=?
+                """,
+                (kanban_task_id, iso(now), incident_id),
+            )
+
+    def get_cloud_incident_by_fingerprint(
+        self, project_slug: str, incident_fingerprint: str
+    ) -> Incident | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM alert_incidents
+                WHERE project_slug=? AND incident_fingerprint=?
+                ORDER BY last_seen_at DESC LIMIT 1
+                """,
+                (project_slug, incident_fingerprint),
+            ).fetchone()
+        return _incident_from_row(row) if row else None
+
+    def get_cloud_incident_for_event(
+        self, event_id: str, project_slug: str, incident_fingerprint: str
+    ) -> Incident | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT i.*
+                FROM alert_event_incidents ei
+                JOIN alert_incidents i ON i.incident_id = ei.incident_id
+                WHERE ei.event_id=? AND i.project_slug=? AND i.incident_fingerprint=?
+                LIMIT 1
+                """,
+                (event_id, project_slug, incident_fingerprint),
+            ).fetchone()
+            if row is not None:
+                return _incident_from_row(row)
+            row = conn.execute(
+                """
+                SELECT * FROM alert_incidents
+                WHERE project_slug=? AND incident_fingerprint=?
+                  AND (first_event_id=? OR last_event_id=?)
+                ORDER BY CASE WHEN last_event_id=? THEN 0 ELSE 1 END, last_seen_at DESC
+                LIMIT 1
+                """,
+                (project_slug, incident_fingerprint, event_id, event_id, event_id),
+            ).fetchone()
+        if row is not None:
+            return _incident_from_row(row)
+        return None
+
+    def get_cloud_incident_for_transition(
+        self, transition_key: str, project_slug: str, incident_fingerprint: str
+    ) -> Incident | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT i.*
+                FROM alert_transitions t
+                JOIN alert_event_incidents ei ON ei.event_id = t.event_id
+                JOIN alert_incidents i ON i.incident_id = ei.incident_id
+                WHERE t.transition_key=? AND i.project_slug=? AND i.incident_fingerprint=?
+                LIMIT 1
+                """,
+                (transition_key, project_slug, incident_fingerprint),
+            ).fetchone()
+        return _incident_from_row(row) if row else None
+
+    def get_cloud_incident_by_id(self, incident_id: str) -> Incident | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM alert_incidents WHERE incident_id=?", (incident_id,)
+            ).fetchone()
+        return _incident_from_row(row) if row else None
+
+    def cloud_incident_kanban_task_id(self, incident_id: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT kanban_task_id FROM alert_incidents WHERE incident_id=?", (incident_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return row["kanban_task_id"]
+
+    def get_cloud_alert_for_event(self, event_id: str) -> ParsedCloudAlert | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT normalized_alert_json FROM alert_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        if row is None or not row["normalized_alert_json"]:
+            return None
+        data = json.loads(str(row["normalized_alert_json"]))
+        if not isinstance(data, dict):
+            return None
+        data.pop("transition_key", None)
+        data.pop("incident_fingerprint", None)
+        return ParsedCloudAlert(**data)
 
     def _apply_cloud_incident_transition(
         self,
@@ -793,12 +1021,24 @@ def _json_dumps(value: object) -> str:
 def _sqs_message_payload(message: SqsMessage) -> dict[str, Any]:
     return {
         "message_id": message.message_id,
-        "receipt_handle": message.receipt_handle,
         "body": message.body,
         "attributes": message.attributes,
         "message_attributes": message.message_attributes,
-        "raw": message.raw,
+        "raw": _redacted_sqs_raw(message.raw),
     }
+
+
+def _redacted_sqs_raw(raw: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(raw)
+    redacted.pop("ReceiptHandle", None)
+    return redacted
+
+
+def _parse_failure_event_id(source_name: str, message: SqsMessage) -> str:
+    seed = _json_dumps({"message_id": message.message_id, "body": message.body})
+    digest = _stable_digest(seed)
+    message_id = message.message_id or "missing-message-id"
+    return f"parse-failed:{source_name}:{message_id}:{digest}"
 
 
 def _optional_json_text(value: object) -> str | None:
@@ -841,6 +1081,24 @@ def _alert_is_older_than_latest_project_transition(
         return False
     latest_seen = max(_parse_cloud_timestamp(str(row["state_changed_at"])) for row in rows)
     return _parse_cloud_timestamp(alert.state_changed_at) < latest_seen
+
+
+def _find_cloud_incident_id_for_transition(
+    conn: sqlite3.Connection, transition_key: str
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT ei.incident_id
+        FROM alert_transitions t
+        JOIN alert_event_incidents ei ON ei.event_id = t.event_id
+        WHERE t.transition_key=?
+        LIMIT 1
+        """,
+        (transition_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["incident_id"])
 
 
 def _find_open_cloud_incident_row(

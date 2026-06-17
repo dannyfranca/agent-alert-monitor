@@ -147,7 +147,7 @@ def test_message_deduplication_is_scoped_by_incident_route(tmp_path: Path) -> No
     assert ledger.count_messages() == 2
 
 
-def test_legacy_default_scope_incident_is_adopted_by_requested_scope(tmp_path: Path) -> None:
+def test_incompatible_telegram_first_incident_schema_is_replaced(tmp_path: Path) -> None:
     db = tmp_path / "ledger.sqlite"
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -162,8 +162,21 @@ def test_legacy_default_scope_incident_is_adopted_by_requested_scope(tmp_path: P
               normalized_json TEXT,
               fingerprint TEXT NOT NULL,
               incident_task_id TEXT,
+              incident_scope TEXT NOT NULL DEFAULT 'default',
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              UNIQUE(platform, chat_id, message_id)
+              UNIQUE(incident_scope, platform, chat_id, message_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO alert_messages (
+              platform, chat_id, message_id, raw_text, fingerprint,
+              incident_task_id, incident_scope
+            ) VALUES (
+              'telegram:sample-api', '-100111', 'legacy-1', 'ALARM',
+              'sample-api:abc123', 't_legacy',
+              'project:sample-api|profile:alert-coordinator|board:sample-api-incidents'
             )
             """
         )
@@ -201,14 +214,27 @@ def test_legacy_default_scope_incident_is_adopted_by_requested_scope(tmp_path: P
     ledger = AlertLedger(db)
     scope = "project:sample-api|profile:alert-coordinator|board:sample-api-incidents"
 
-    incident = ledger.find_open_incident("sample-api:abc123", incident_scope=scope)
+    assert ledger.find_open_incident("sample-api:abc123", incident_scope=scope) is None
+    with ledger.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(alert_incidents)")}
+        row_count = conn.execute("SELECT COUNT(*) FROM alert_incidents").fetchone()[0]
+        message = conn.execute("SELECT incident_task_id FROM alert_messages").fetchone()
+    duplicate = ledger.ingest_message(
+        platform="telegram:sample-api",
+        chat_id="-100111",
+        message_id="legacy-1",
+        raw_text="ALARM: Service5xx service=api",
+        fingerprint_namespace="sample-api",
+        incident_scope=scope,
+    )
+    assert {"incident_id", "project_slug", "incident_fingerprint"} <= columns
+    assert row_count == 0
+    assert message["incident_task_id"] is None
+    assert duplicate.duplicate is True
+    assert duplicate.correlated_incident_task_id is None
 
-    assert incident is not None
-    assert incident.incident_task_id == "t_legacy"
-    assert incident.incident_scope == scope
 
-
-def test_legacy_unlinked_message_scope_is_adopted_for_idempotency(tmp_path: Path) -> None:
+def test_incompatible_message_schema_is_replaced_without_adopting_old_rows(tmp_path: Path) -> None:
     db = tmp_path / "ledger.sqlite"
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -239,9 +265,20 @@ def test_legacy_unlinked_message_scope_is_adopted_for_idempotency(tmp_path: Path
     ledger = AlertLedger(db)
     scope = "project:sample-api|profile:alert-coordinator|board:sample-api-incidents"
 
-    seed = ledger.idempotency_seed("sample-api:abc123", "fallback", incident_scope=scope)
-
-    assert seed == "legacy-1"
+    assert ledger.count_messages() == 0
+    assert (
+        ledger.idempotency_seed("sample-api:abc123", "fallback", incident_scope=scope)
+        == "fallback"
+    )
+    first = ledger.ingest_message(
+        platform="telegram:sample-api",
+        chat_id="-100111",
+        message_id="legacy-1",
+        raw_text="ALARM: Service5xx service=api",
+        fingerprint_namespace="sample-api",
+        incident_scope=scope,
+    )
+    assert first.duplicate is False
 
 
 def test_ledger_runtime_creation_uses_restrictive_permissions(tmp_path: Path) -> None:

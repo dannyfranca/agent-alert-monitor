@@ -36,6 +36,12 @@ class AwsSqsSourceConfig:
     region: str
     envelope: str
     type: str = "aws_sqs"
+    queue_arn_env: str | None = None
+    queue_arn: str | None = None
+    dlq_queue_url_env: str | None = None
+    dlq_queue_url: str | None = None
+    dlq_queue_arn_env: str | None = None
+    dlq_queue_arn: str | None = None
     wait_time_seconds: int = 20
     max_messages: int = 10
     visibility_timeout_seconds: int = 300
@@ -191,6 +197,24 @@ def _int_setting(data: dict[str, Any], key: str, default: int, *, strict_env: bo
     return int(value)
 
 
+def _optional_env_name(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _optional_env_value(
+    explicit_value: object, env_name: str | None, env_map: Mapping[str, str]
+) -> str | None:
+    if explicit_value is not None and explicit_value != "":
+        return str(explicit_value)
+    if env_name:
+        env_value = env_map.get(env_name)
+        if env_value:
+            return str(env_value)
+    return None
+
+
 def _runtime_config(data: dict[str, Any], *, config_dir: Path) -> RuntimeConfig:
     runtime_data = _required_section(data, "runtime")
     state_dir = _resolve_path(runtime_data.get("state_dir", "./state"), config_dir=config_dir)
@@ -287,6 +311,16 @@ def _parse_sources(
         if source_type == "aws_sqs":
             queue_url_env = str(source_data.get("queue_url_env", ""))
             queue_url = str(source_data.get("queue_url") or env_map.get(queue_url_env, ""))
+            queue_arn_env = _optional_env_name(source_data.get("queue_arn_env"))
+            queue_arn = _optional_env_value(source_data.get("queue_arn"), queue_arn_env, env_map)
+            dlq_queue_url_env = _optional_env_name(source_data.get("dlq_queue_url_env"))
+            dlq_queue_url = _optional_env_value(
+                source_data.get("dlq_queue_url"), dlq_queue_url_env, env_map
+            )
+            dlq_queue_arn_env = _optional_env_name(source_data.get("dlq_queue_arn_env"))
+            dlq_queue_arn = _optional_env_value(
+                source_data.get("dlq_queue_arn"), dlq_queue_arn_env, env_map
+            )
             region = str(source_data.get("region", ""))
             envelope = str(source_data.get("envelope", ""))
             if strict_env:
@@ -314,6 +348,12 @@ def _parse_sources(
                     queue_url=queue_url,
                     region=region,
                     envelope=envelope,
+                    queue_arn_env=queue_arn_env,
+                    queue_arn=queue_arn,
+                    dlq_queue_url_env=dlq_queue_url_env,
+                    dlq_queue_url=dlq_queue_url,
+                    dlq_queue_arn_env=dlq_queue_arn_env,
+                    dlq_queue_arn=dlq_queue_arn,
                     wait_time_seconds=_int_setting(
                         source_data, "wait_time_seconds", 20, strict_env=strict_env
                     ),

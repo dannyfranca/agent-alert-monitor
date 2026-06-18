@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from agent_alert_monitor.config import (
     AgentConfig,
     HermesConfig,
@@ -16,7 +14,6 @@ from agent_alert_monitor.config import (
 from agent_alert_monitor.coordinator import AlertCoordinator
 from agent_alert_monitor.kanban import DryRunKanbanClient, KanbanCardRequest
 from agent_alert_monitor.ledger import AlertLedger
-from agent_alert_monitor.telegram_ingest import poll_once
 
 
 class RecordingKanbanClient:
@@ -177,84 +174,3 @@ def test_duplicate_without_incident_retries_kanban_create(tmp_path: Path) -> Non
     assert result.action == "created_incident"
     assert result.duplicate is True
     assert len(kanban.created_cards) == 1
-
-
-def test_unmatched_recovery_posts_visible_feedback_in_live_poll(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ledger = AlertLedger(tmp_path / "ledger.sqlite")
-    config = make_config(tmp_path)
-    coordinator = AlertCoordinator(config, ledger=ledger, kanban_client=RecordingKanbanClient())
-    sent_messages: list[str] = []
-
-    monkeypatch.setattr(
-        "agent_alert_monitor.telegram_ingest.requests.get",
-        lambda *args, **kwargs: FakeTelegramResponse(
-            telegram_update(42, 2, "OK: Service5xx service=api")
-        ),
-    )
-
-    def fake_post(*args, **kwargs):
-        sent_messages.append(kwargs["json"]["text"])
-        return FakeTelegramResponse({"ok": True})
-
-    monkeypatch.setattr("agent_alert_monitor.telegram_ingest.requests.post", fake_post)
-
-    results = poll_once(config, coordinator, dry_run=False)
-
-    assert len(results) == 1
-    result = results[0]
-    assert result.action == "recovery_unmatched"
-    assert result.incident_task_id is None
-    assert result.channel_message
-    assert "Status: recovery alert did not match an open incident" in result.channel_message
-    assert sent_messages == [result.channel_message]
-
-
-def test_duplicate_recovery_retry_can_finalize_open_incident(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ledger = AlertLedger(tmp_path / "ledger.sqlite")
-    kanban = RecordingKanbanClient()
-    config = make_config(tmp_path)
-    coordinator = AlertCoordinator(config, ledger=ledger, kanban_client=kanban)
-
-    created = coordinator.handle_alert(
-        "telegram", "-100123", "1", "ALARM: Service5xx service=api", dry_run=False
-    )
-    coordinator.record_channel_delivery(created, "acked")
-
-    recovery = coordinator.handle_alert(
-        "telegram", "-100123", "2", "OK: Service5xx service=api", dry_run=False
-    )
-    assert recovery.action == "recovery_matched"
-    # Simulate a final Telegram delivery or ledger update failure: the recovery row was
-    # ingested, but record_channel_delivery was not called, so the incident remains open.
-
-    sent_messages: list[str] = []
-    monkeypatch.setattr(
-        "agent_alert_monitor.telegram_ingest.requests.get",
-        lambda *args, **kwargs: FakeTelegramResponse(
-            telegram_update(42, 2, "OK: Service5xx service=api")
-        ),
-    )
-
-    def fake_post(*args, **kwargs):
-        sent_messages.append(kwargs["json"]["text"])
-        return FakeTelegramResponse({"ok": True})
-
-    monkeypatch.setattr("agent_alert_monitor.telegram_ingest.requests.post", fake_post)
-
-    results = poll_once(config, coordinator, dry_run=False)
-
-    assert len(results) == 1
-    retry = results[0]
-    assert retry.action == "recovery_matched"
-    assert retry.duplicate is True
-    assert retry.channel_message
-    assert sent_messages == [retry.channel_message]
-
-    incident = ledger.get_incident(created.incident_task_id or "")
-    assert incident is not None
-    assert incident.status == "resolved"
-    assert incident.last_channel_status == "final"

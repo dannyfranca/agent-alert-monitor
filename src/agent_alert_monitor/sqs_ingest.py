@@ -14,7 +14,7 @@ from .config import AgentConfig, AwsSqsSourceConfig
 from .incident_cards import IncidentCardContext, render_cloudwatch_incident_card
 from .kanban import KanbanCardRequest, KanbanClient
 from .ledger import AlertLedger, CloudAlertProcessResult
-from .telegram_ingest import send_telegram_message
+from .telegram_status import send_telegram_message
 
 REQUIRED_SIDE_EFFECTS = "required_side_effects"
 

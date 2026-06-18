@@ -22,13 +22,6 @@ class TelegramConfig:
 
 
 @dataclass(frozen=True)
-class TelegramSourceConfig:
-    name: str
-    telegram: TelegramConfig
-    type: str = "telegram"
-
-
-@dataclass(frozen=True)
 class AwsSqsSourceConfig:
     name: str
     queue_url_env: str
@@ -48,7 +41,7 @@ class AwsSqsSourceConfig:
     delete_policy: str = "after_successful_side_effects"
 
 
-AlertSourceConfig = AwsSqsSourceConfig | TelegramSourceConfig
+AlertSourceConfig = AwsSqsSourceConfig
 
 
 @dataclass(frozen=True)
@@ -110,12 +103,6 @@ class ProjectConfig:
     environment: str | None = None
     sources: tuple[AlertSourceConfig, ...] = ()
     sinks: tuple[AlertSinkConfig, ...] = ()
-
-    @property
-    def telegram_source(self) -> TelegramSourceConfig | None:
-        return next(
-            (source for source in self.sources if isinstance(source, TelegramSourceConfig)), None
-        )
 
     @property
     def telegram_sink(self) -> TelegramSinkConfig | None:
@@ -236,41 +223,6 @@ def _watchdog_config(data: dict[str, Any]) -> WatchdogConfig:
     )
 
 
-def _telegram_config_from_data(
-    telegram_data: dict[str, Any],
-    *,
-    env_map: Mapping[str, str],
-    runtime: RuntimeConfig,
-    config_dir: Path,
-    slug: str,
-    legacy_default: bool,
-    strict_env: bool,
-) -> TelegramConfig:
-    token_env = str(telegram_data.get("bot_token_env", "ALERT_MONITOR_TELEGRAM_BOT_TOKEN"))
-    bot_token = str(telegram_data.get("bot_token") or env_map.get(token_env) or "")
-    alert_chat_id = str(telegram_data.get("alert_chat_id", ""))
-    if not alert_chat_id and strict_env:
-        raise ValueError(f"missing projects[{slug}].telegram.alert_chat_id")
-
-    offset_path_value = telegram_data.get("offset_path")
-    if offset_path_value:
-        offset_path = _resolve_path(offset_path_value, config_dir=config_dir)
-    elif legacy_default:
-        offset_path = runtime.state_dir / "telegram-offset.json"
-    else:
-        offset_path = runtime.state_dir / f"{slug}-telegram-offset.json"
-
-    return TelegramConfig(
-        bot_token=bot_token,
-        alert_chat_id=alert_chat_id,
-        bot_token_env=token_env,
-        poll_interval_seconds=_int_setting(
-            telegram_data, "poll_interval_seconds", 5, strict_env=strict_env
-        ),
-        offset_path=offset_path,
-    )
-
-
 def _telegram_config_from_sink(
     sink: TelegramSinkConfig,
     *,
@@ -291,14 +243,11 @@ def _parse_sources(
     *,
     env_map: Mapping[str, str],
     slug: str,
-    legacy_telegram: TelegramConfig | None,
     strict_env: bool,
 ) -> tuple[AlertSourceConfig, ...]:
     sources_data = project_data.get("sources")
     if sources_data is None:
-        if legacy_telegram is None:
-            return ()
-        return (TelegramSourceConfig(name=f"{slug}-telegram", telegram=legacy_telegram),)
+        return ()
     if not isinstance(sources_data, list):
         raise ValueError(f"projects[{slug}].sources must be a list")
 
@@ -368,13 +317,6 @@ def _parse_sources(
                     ),
                 )
             )
-        elif source_type == "telegram":
-            if legacy_telegram is None:
-                raise ValueError(
-                    f"projects[{slug}].sources[{index}] type=telegram requires "
-                    f"projects[{slug}].telegram"
-                )
-            sources.append(TelegramSourceConfig(name=name, telegram=legacy_telegram))
         else:
             raise ValueError(f"unsupported projects[{slug}].sources[{index}].type: {source_type}")
     return tuple(sources)
@@ -385,21 +327,11 @@ def _parse_sinks(
     *,
     env_map: Mapping[str, str],
     slug: str,
-    legacy_telegram: TelegramConfig | None,
     strict_env: bool,
 ) -> tuple[AlertSinkConfig, ...]:
     sinks_data = project_data.get("sinks")
     if sinks_data is None:
-        if legacy_telegram is None:
-            return ()
-        return (
-            TelegramSinkConfig(
-                name=f"{slug}-telegram",
-                bot_token=legacy_telegram.bot_token,
-                bot_token_env=legacy_telegram.bot_token_env,
-                chat_id=legacy_telegram.alert_chat_id,
-            ),
-        )
+        return ()
     if not isinstance(sinks_data, list):
         raise ValueError(f"projects[{slug}].sinks must be a list")
 
@@ -453,22 +385,8 @@ def _parse_project(
         raise ValueError("project slug is required")
     display_name = str(project_data.get("display_name") or slug).strip()
 
-    telegram_section = project_data.get("telegram")
-    if telegram_section is not None and not isinstance(telegram_section, dict):
-        raise ValueError(f"config section must be a mapping: projects[{slug}].telegram")
-    legacy_telegram = (
-        _telegram_config_from_data(
-            telegram_section,
-            env_map=env_map,
-            runtime=runtime,
-            config_dir=config_dir,
-            slug=slug,
-            legacy_default=legacy_default,
-            strict_env=strict_env,
-        )
-        if telegram_section is not None
-        else None
-    )
+    if "telegram" in project_data:
+        raise ValueError(f"projects[{slug}].telegram is no longer supported; use sinks[]")
 
     hermes_data = _required_section(project_data, "hermes")
     kanban_data = _required_section(project_data, "kanban")
@@ -477,23 +395,21 @@ def _parse_project(
         project_data,
         env_map=env_map,
         slug=slug,
-        legacy_telegram=legacy_telegram,
         strict_env=strict_env,
     )
     sinks = _parse_sinks(
         project_data,
         env_map=env_map,
         slug=slug,
-        legacy_telegram=legacy_telegram,
         strict_env=strict_env,
     )
-    if legacy_telegram is None and not sources and strict_env:
-        raise ValueError(f"projects[{slug}] requires telegram config or explicit sources")
+    if strict_env and not any(isinstance(source, AwsSqsSourceConfig) for source in sources):
+        raise ValueError(f"projects[{slug}] requires at least one aws_sqs source")
     explicit_sinks = project_data.get("sinks") is not None
     telegram = (
         _telegram_config_from_sink(sinks[0], runtime=runtime, slug=slug)
         if explicit_sinks and sinks
-        else legacy_telegram
+        else None
     )
 
     return ProjectConfig(
@@ -532,16 +448,7 @@ def _parse_project(
 def _project_entries(data: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     projects_data = data.get("projects")
     if projects_data is None:
-        return (
-            {
-                "slug": data.get("project_slug", "default"),
-                "display_name": data.get("project_display_name", "Application"),
-                "telegram": _required_section(data, "telegram"),
-                "hermes": _required_section(data, "hermes"),
-                "kanban": _required_section(data, "kanban"),
-                "messages": data.get("messages") or {},
-            },
-        )
+        raise ValueError("projects must be a non-empty list")
     if not isinstance(projects_data, list) or not projects_data:
         raise ValueError("projects must be a non-empty list")
     entries: list[dict[str, Any]] = []

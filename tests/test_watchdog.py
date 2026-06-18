@@ -3,9 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from agent_alert_monitor.alert import parse_alert_text
+from agent_alert_monitor.alert import SqsMessage, parse_alert_text
+from agent_alert_monitor.cloud_parsers import AwsSnsCloudWatchAlarmParser
 from agent_alert_monitor.ledger import AlertLedger
 from agent_alert_monitor.watchdog import WatchdogPolicy, evaluate_stalled_incidents
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_watchdog_emits_stalled_message_for_silent_open_incident(tmp_path: Path) -> None:
@@ -64,6 +67,38 @@ def test_watchdog_filters_by_incident_scope_when_requested(tmp_path: Path) -> No
 
     assert len(due) == 1
     assert due[0].incident_scope == alpha_scope
+
+
+def test_watchdog_includes_stale_sqs_cloud_incident_for_project_scope(
+    tmp_path: Path,
+) -> None:
+    ledger = AlertLedger(tmp_path / "ledger.sqlite")
+    opened = datetime(2026, 6, 13, 12, tzinfo=UTC)
+    message = SqsMessage(
+        message_id="sqs-alarm-1",
+        receipt_handle="sanitized-receipt-handle",
+        body=(FIXTURES / "aws_sns_cloudwatch_alarm_alarm.json").read_text(encoding="utf-8"),
+        raw={"fixture": "alarm"},
+    )
+    alert = AwsSnsCloudWatchAlarmParser(project_slug="ticketdovale").parse(message)
+    opened_result = ledger.process_cloud_alert(
+        "ticketdovale-prod-alerts", message, alert, now=opened
+    )
+    assert opened_result.incident_id is not None
+    ledger.attach_cloud_incident_kanban_task(opened_result.incident_id, "t_cloud_incident")
+
+    due = evaluate_stalled_incidents(
+        ledger,
+        now=opened + timedelta(minutes=16),
+        policy=WatchdogPolicy(stalled_after_seconds=15 * 60),
+        project_slug="ticketdovale",
+        incident_scope="project:ticketdovale|profile:alert-coordinator|board:alerts",
+    )
+
+    assert len(due) == 1
+    assert due[0].incident_task_id == opened_result.incident_id
+    assert due[0].incident_scope == "project:ticketdovale|source:sqs"
+    assert due[0].message.startswith("🚨 Alert monitor stalled")
 
 
 def test_watchdog_stays_silent_when_recent_status_exists(tmp_path: Path) -> None:

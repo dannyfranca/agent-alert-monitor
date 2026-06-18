@@ -175,6 +175,21 @@ def run_setup_wizard(
         queue_url = _ask_required(input_fn, print_fn, "Existing SQS queue URL")
         env_values[queue_url_env] = queue_url
         while True:
+            queue_arn_env = _ask(
+                input_fn,
+                "SQS queue ARN env var",
+                f"{_env_slug(slug)}_AGENT_ALERT_QUEUE_ARN",
+            )
+            if not _is_env_name(queue_arn_env):
+                print_fn(f"❌ Invalid environment variable name: {queue_arn_env}")
+                continue
+            if queue_arn_env in env_values or queue_arn_env in _reserved_env_names():
+                print_fn(f"❌ Environment variable name already used/reserved: {queue_arn_env}")
+                continue
+            break
+        queue_arn = _ask_required(input_fn, print_fn, "Existing SQS queue ARN")
+        env_values[queue_arn_env] = queue_arn
+        while True:
             dlq_url_env = _ask(
                 input_fn,
                 "SQS DLQ URL env var",
@@ -290,6 +305,7 @@ def run_setup_wizard(
                         "name": f"{slug}-prod-alerts",
                         "type": "aws_sqs",
                         "queue_url_env": queue_url_env,
+                        "queue_arn_env": queue_arn_env,
                         "dlq_queue_url_env": dlq_url_env,
                         "dlq_queue_arn_env": dlq_arn_env,
                         "region": aws_region,

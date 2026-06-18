@@ -38,9 +38,23 @@ def _threshold_seconds(incident: Incident, policy: WatchdogPolicy) -> int:
     return policy.stalled_after_seconds
 
 
+def _scope_project_slug(incident_scope: str) -> str | None:
+    for part in incident_scope.split("|"):
+        if part.startswith("project:"):
+            return part.removeprefix("project:")
+    return None
+
+
+def _is_sqs_cloud_scope(incident_scope: str) -> bool:
+    return "source:sqs" in incident_scope.split("|")
+
+
 def _belongs_to_project(incident: Incident, project_slug: str | None) -> bool:
     if project_slug is None:
         return True
+    scope_project = _scope_project_slug(incident.incident_scope)
+    if scope_project is not None:
+        return scope_project == project_slug
     if project_slug == "default":
         return ":" not in incident.fingerprint
     return incident.fingerprint.startswith(f"{project_slug}:")
@@ -51,7 +65,11 @@ def _belongs_to_scope(incident: Incident, incident_scope: str | None) -> bool:
         return True
     if incident.incident_scope == incident_scope:
         return True
-    return incident.incident_scope == "default" and incident_scope != "default"
+    if incident.incident_scope == "default" and incident_scope != "default":
+        return True
+    if _is_sqs_cloud_scope(incident.incident_scope):
+        return _scope_project_slug(incident.incident_scope) == _scope_project_slug(incident_scope)
+    return False
 
 
 def evaluate_stalled_incidents(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -27,7 +28,9 @@ class AwsSnsCloudWatchAlarmParser:
             account_id = _required_str(cloudwatch_alarm, "AWSAccountId")
             region = _region_from_alarm_arn(alarm_arn) or _required_region_from_topic_arn(topic_arn)
             state = _required_str(cloudwatch_alarm, "NewStateValue")
-            state_changed_at = _required_str(cloudwatch_alarm, "StateChangeTime")
+            state_changed_at = _required_iso_timestamp(
+                cloudwatch_alarm, "StateChangeTime", field="StateChangeTime"
+            )
             previous_state = _optional_str(cloudwatch_alarm.get("OldStateValue"))
             trigger = _optional_mapping(cloudwatch_alarm.get("Trigger"))
             dimensions = _dimensions_from_sns_trigger(trigger)
@@ -90,7 +93,9 @@ class AwsEventBridgeCloudWatchAlarmParser:
             alarm_name = _required_str(detail, "alarmName")
             alarm_arn = _cloudwatch_alarm_arn_from_eventbridge(event)
             current_state = _required_str(state, "value")
-            state_changed_at = _required_str(state, "timestamp")
+            state_changed_at = _required_iso_timestamp(
+                state, "timestamp", field="detail.state.timestamp"
+            )
             previous_state = _previous_state_value(detail)
             metric = _metric_from_eventbridge_detail(detail)
             dimensions = _dimensions_from_eventbridge_metric(metric)
@@ -155,6 +160,15 @@ def _optional_str(value: object) -> str | None:
     if value is None or value == "":
         return None
     return str(value)
+
+
+def _required_iso_timestamp(data: dict[str, Any], key: str, *, field: str) -> str:
+    value = _required_str(data, key)
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"invalid {field}") from None
+    return value
 
 
 def _required_mapping(data: dict[str, Any], key: str) -> dict[str, Any]:

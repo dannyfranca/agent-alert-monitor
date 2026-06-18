@@ -1,12 +1,33 @@
 from __future__ import annotations
 
 import stat
+import subprocess
+import types
 from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
 
+from agent_alert_monitor.config import load_config
+from agent_alert_monitor.ledger import AlertLedger
 from agent_alert_monitor.setup_wizard import CommandResult, run_setup_wizard
+from agent_alert_monitor.sqs_ingest import run_local_preflight
+
+
+class QueueArnMismatchSqsClient:
+    def get_queue_attributes(self, **_kwargs):
+        return {"Attributes": {"QueueArn": "arn:aws:sqs:sa-east-1:123:wrong-queue"}}
+
+    def receive_message(self, **_kwargs):
+        raise AssertionError("ReceiveMessage should not run during ARN preflight failure")
+
+    def delete_message(self, **_kwargs):
+        raise AssertionError("DeleteMessage should not run during ARN preflight failure")
+
+
+class FakeStsClient:
+    def get_caller_identity(self) -> dict[str, str]:
+        return {"Account": "123"}
 
 
 def _input_from(values: list[str], prompts: list[str]):
@@ -27,6 +48,8 @@ def _base_inputs(*, aws: bool = False, aws_dir: str = "") -> list[str]:
         "sample-api",
         "",  # queue env default
         "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts",
+        "",  # queue arn env default
+        "arn:aws:sqs:sa-east-1:123:sample-api-alerts",
         "",  # dlq url env default
         "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts-dlq",
         "",  # dlq arn env default
@@ -111,6 +134,7 @@ def test_interactive_setup_writes_config_env_and_prints_data_instructions(tmp_pa
     project = config["projects"][0]
     assert project["sources"][0]["type"] == "aws_sqs"
     assert project["sources"][0]["queue_url_env"] == "SAMPLE_API_AGENT_ALERT_QUEUE_URL"
+    assert project["sources"][0]["queue_arn_env"] == "SAMPLE_API_AGENT_ALERT_QUEUE_ARN"
     assert project["sources"][0]["dlq_queue_url_env"] == "SAMPLE_API_AGENT_ALERT_DLQ_URL"
     assert project["sources"][0]["dlq_queue_arn_env"] == "SAMPLE_API_AGENT_ALERT_DLQ_ARN"
     assert project["sinks"][0]["bot_token_env"] == "ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN"
@@ -126,6 +150,10 @@ def test_interactive_setup_writes_config_env_and_prints_data_instructions(tmp_pa
     )
     assert queue_line in env_text
     assert "ALERT_MONITOR_SQS_SOURCE='sample-api-prod-alerts'" in env_text
+    assert (
+        "SAMPLE_API_AGENT_ALERT_QUEUE_ARN="
+        "'arn:aws:sqs:sa-east-1:123:sample-api-alerts'"
+    ) in env_text
     assert (
         "SAMPLE_API_AGENT_ALERT_DLQ_URL="
         "'https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts-dlq'"
@@ -153,6 +181,59 @@ def test_interactive_setup_writes_config_env_and_prints_data_instructions(tmp_pa
     ]:
         assert removed not in rendered
     assert ["hermes", "profile", "list"] in commands
+
+
+def test_setup_wizard_generated_queue_arn_enables_health_mismatch_detection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result = run_setup_wizard(
+        root=tmp_path,
+        input_fn=_input_from(_base_inputs(), []),
+        secret_fn=lambda prompt: "123456:telegram-token",
+        print_fn=lambda text: None,
+        command_runner=lambda command, timeout=30: CommandResult(0, "ok\n"),
+        validate_live=False,
+        force=True,
+    )
+    cfg = load_config(
+        result.config_path,
+        project_slug="sample-api",
+        env={
+            "ALERT_MONITOR_STATE_DIR": str(tmp_path / "state"),
+            "SAMPLE_API_AGENT_ALERT_QUEUE_URL": "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts",
+            "SAMPLE_API_AGENT_ALERT_QUEUE_ARN": "arn:aws:sqs:sa-east-1:123:sample-api-alerts",
+            "SAMPLE_API_AGENT_ALERT_DLQ_URL": "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts-dlq",
+            "SAMPLE_API_AGENT_ALERT_DLQ_ARN": "arn:aws:sqs:sa-east-1:123:sample-api-alerts-dlq",
+            "ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN": "123456:telegram-token",
+        },
+    )
+    source = cfg.project.sources[0]
+
+    def fake_run(command: Sequence[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        if command == ["/bin/hermes", "profile", "list"]:
+            return subprocess.CompletedProcess(command, 0, stdout="alert-coordinator\n", stderr="")
+        if command == ["/bin/hermes", "-p", "alert-coordinator", "kanban", "boards", "list"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="sample-api-incidents\n", stderr=""
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("agent_alert_monitor.sqs_ingest.shutil.which", lambda name: "/bin/hermes")
+    monkeypatch.setattr("agent_alert_monitor.sqs_ingest.subprocess.run", fake_run)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "boto3",
+        types.SimpleNamespace(client=lambda *_, **__: FakeStsClient()),
+    )
+
+    preflight = run_local_preflight(
+        cfg, source, AlertLedger(cfg.runtime.ledger_path), QueueArnMismatchSqsClient()
+    )
+
+    assert source.queue_arn_env == "SAMPLE_API_AGENT_ALERT_QUEUE_ARN"
+    assert source.queue_arn == "arn:aws:sqs:sa-east-1:123:sample-api-alerts"
+    assert preflight.ok is False
+    assert preflight.checks["sqs_queue_access"] == "failed: arn_mismatch"
 
 
 def test_setup_wizard_refuses_to_overwrite_existing_files_without_force(tmp_path: Path) -> None:
@@ -201,6 +282,8 @@ def test_setup_wizard_repompts_duplicate_project_slugs(tmp_path: Path) -> None:
                 "",
                 "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts",
                 "",
+                "arn:aws:sqs:sa-east-1:123:sample-api-alerts",
+                "",
                 "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts-dlq",
                 "",
                 "arn:aws:sqs:sa-east-1:123:sample-api-alerts-dlq",
@@ -220,6 +303,8 @@ def test_setup_wizard_repompts_duplicate_project_slugs(tmp_path: Path) -> None:
                 "worker-queue",
                 "",
                 "https://sqs.sa-east-1.amazonaws.com/123/worker-alerts",
+                "",
+                "arn:aws:sqs:sa-east-1:123:worker-alerts",
                 "",
                 "https://sqs.sa-east-1.amazonaws.com/123/worker-alerts-dlq",
                 "",

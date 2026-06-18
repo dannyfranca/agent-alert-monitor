@@ -24,7 +24,8 @@ def test_sqs_service_templates_include_readiness_and_live_listener() -> None:
     assert "sqs-ingest" not in readiness
     assert "sqs-peek" not in readiness
     assert "--dry-run" not in readiness
-    assert " sqs-ingest " in listener
+    assert " sqs-listen " in listener
+    assert "sqs-ingest" not in listener
     assert "--dry-run" not in listener
 
 

@@ -10,7 +10,7 @@ WorkingDirectory=__ALERT_MONITOR_ROOT_SYSTEMD__
 EnvironmentFile=-__ALERT_MONITOR_ENV_SYSTEMD__
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=ALERT_MONITOR_SQS_SOURCE=sample-api-prod-alerts
-ExecStart=__ALERT_MONITOR_BIN_SYSTEMD__ --config __ALERT_MONITOR_CONFIG_SYSTEMD__ sqs-ingest --source ${ALERT_MONITOR_SQS_SOURCE}
+ExecStart=__ALERT_MONITOR_BIN_SYSTEMD__ --config __ALERT_MONITOR_CONFIG_SYSTEMD__ sqs-listen --source ${ALERT_MONITOR_SQS_SOURCE}
 Restart=always
 RestartSec=30
 

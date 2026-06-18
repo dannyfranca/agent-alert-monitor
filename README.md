@@ -35,64 +35,64 @@ Watchdog = no-silence guarantee
 
 ```mermaid
 flowchart TD
-    A[Alerting system alarms] --> B[Configured Telegram alert channel]
-    B --> C[Local Telegram bot polling/listening]
-    C --> D[Alert coordinator profile/session]
-    D --> E[(Alert ledger SQLite)]
-    D --> F{New or related alert?}
-    F -->|Related| G[Update existing incident card/comment]
-    F -->|New| H[Create high-priority Kanban incident]
-    H --> I[Debugger profile]
-    G --> I
-    I --> J{Classification}
-    J -->|Self-recovered / transient| K[Post final status and complete incident]
-    J -->|Code fix likely| L[Create high-priority coder card]
-    J -->|Infra/manual action| M[Block incident and post needed action]
-    J -->|Human decision| N[Block incident and post decision request]
-    J -->|Missing access/tooling| O[Block incident and post missing prerequisite]
-    L --> P[Coder opens/updates PR]
-    P --> Q[Post PR status to alert channel]
-    R[Watchdog] --> E
-    R --> S[Post stalled/failure message if silent]
+    A[CloudWatch alarm state change] --> B[Existing producer routing: SNS fanout or EventBridge rule]
+    B --> C[Dedicated SQS Standard intake queue]
+    C --> D[Local agent-alert-monitor SQS poller]
+    D --> E[(SQLite alert ledger)]
+    D --> F[Deterministic SNS/EventBridge envelope parser]
+    F --> G{State transition}
+    G -->|Duplicate event or transition| H[Delete only after durable duplicate record]
+    G -->|ALARM| I[Create or correlate Kanban incident]
+    G -->|OK / recovery| J[Resolve matching open incident]
+    G -->|INSUFFICIENT_DATA| K[Configured status/noise policy]
+    I --> L[Debugger profile investigates CloudWatch/logs/deploy context]
+    L --> M{Classification}
+    M -->|Code fix likely| N[Create bounded coder card]
+    M -->|Self-recovered / ops / decision / access| O[Post visible status and complete/block]
+    N --> P[Coder opens PR and blocks review-required]
+    J --> Q[Telegram final/status message]
+    O --> Q
+    P --> Q
+    R[Health/watchdog/DLQ checks] --> E
+    R --> Q
 ```
 
-### Sequence: new alert → debugger → resolution
+### Sequence: new SQS alert → debugger → resolution
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Source as Alert source
-    participant TG as Telegram alert channel
-    participant Bot as Local bot poller
-    participant Coord as alert-coordinator
+    participant CW as CloudWatch
+    participant Producer as SNS/EventBridge producer path
+    participant SQS as Dedicated SQS queue
+    participant Agent as Local SQS poller
     participant Ledger as alert ledger
     participant KB as Kanban board
+    participant TG as Telegram status sink
     participant Debug as debugger profile
     participant Coder as coder profile
 
-    Source->>TG: Alert message
-    TG->>Bot: channel_post update
-    Bot->>Coord: Dispatch channel message into coordinator
-    Coord->>Ledger: Store raw message + project-scoped fingerprint
-    Coord->>KB: Find/create incident card, priority 1000+
-    Coord->>TG: Ack: investigating / correlated
+    CW->>Producer: Alarm state change JSON
+    Producer->>SQS: Full SNS/EventBridge envelope
+    Agent->>Agent: Preflight SQLite, AWS, Hermes/Kanban, Telegram
+    Agent->>SQS: ReceiveMessage only when preflight is green
+    Agent->>Ledger: Store raw SQS/envelope + normalized alert
+    Ledger-->>Agent: event_id / transition_key / incident_fingerprint decision
+    Agent->>KB: Create, correlate, or resolve incident
+    Agent->>TG: Ack/status/final message as configured
+    Agent->>SQS: DeleteMessage only after ledger + required side effects
     KB->>Debug: Dispatcher spawns debugger card
-    Debug->>TG: Ack: investigation started
-    Debug->>Debug: Query logs/metrics/deploy context
-    Debug->>KB: Comment evidence + classification
+    Debug->>TG: Investigation started / blocked / final status
+    Debug->>KB: Structured evidence + classification
 
-    alt Self-recovered / transient
-        Debug->>TG: Final: recovered + evidence
-        Debug->>KB: Complete incident
-    else Code fix likely
-        Debug->>KB: Create high-priority coder card
-        Debug->>TG: Update: code fix queued
+    alt Code fix likely
+        Debug->>KB: Create bounded coder card
         KB->>Coder: Dispatcher spawns coder card
         Coder->>KB: Opens PR, blocks review-required
-        Coord->>TG: PR opened/status
-    else Decision / infra / missing access
-        Debug->>TG: Needs action/decision/prereq
-        Debug->>KB: Block incident with same concise reason
+        Agent->>TG: PR opened/status after lifecycle sync
+    else Self-recovered / ops / decision / access
+        Debug->>TG: Visible final or needed-action status
+        Debug->>KB: Complete or block with same concise reason
     end
 ```
 
@@ -100,12 +100,17 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Observed: Telegram channel_post
-    Observed --> Correlating: coordinator parses/fingerprints
-    Correlating --> Duplicate: same alert already handled
-    Correlating --> IncidentOpen: new or active incident
-    Duplicate --> [*]
+    [*] --> RawReceived: SQS ReceiveMessage after green preflight
+    RawReceived --> Parsed: SNS/EventBridge envelope normalized
+    Parsed --> DuplicateEvent: event_id already recorded
+    Parsed --> DuplicateTransition: transition_key already recorded
+    Parsed --> IncidentOpen: ALARM creates/correlates incident_fingerprint
+    Parsed --> Recovery: OK matches incident_fingerprint
+    DuplicateEvent --> Deleted: durable duplicate record exists
+    DuplicateTransition --> Deleted: durable duplicate transition exists
     IncidentOpen --> DebugQueued: Kanban card priority 1000+
+    Recovery --> Resolved: matching incident recorded
+    Resolved --> StatusAttempted: Telegram status best-effort
     DebugQueued --> Investigating: debugger claimed
     Investigating --> SelfRecovered: metrics/logs normalized
     Investigating --> CodeFixQueued: coder card created
@@ -113,25 +118,26 @@ stateDiagram-v2
     Investigating --> DecisionBlocked: human/operator decision needed
     Investigating --> AccessBlocked: missing credentials/tooling
     Investigating --> Stalled: watchdog SLA missed
-    SelfRecovered --> Done: final channel message posted
+    SelfRecovered --> StatusAttempted
     CodeFixQueued --> PROpened: coder opens PR
     PROpened --> AwaitingReview: review-required
-    AwaitingReview --> Done: PR merged / incident resolved
-    OpsBlocked --> Done: operator resolves and confirms
+    AwaitingReview --> Resolved: PR merged / incident resolved
+    OpsBlocked --> Resolved: operator resolves and confirms
     DecisionBlocked --> Investigating: operator answers + unblock
     AccessBlocked --> Investigating: access fixed + unblock
     Stalled --> Investigating: reclaimed/unblocked
+    StatusAttempted --> Deleted: SQS message deleted after ledger/Kanban side effects
 ```
 
 ## What is implemented in v0.1.0
 
 - Python package with CLI entry point `agent-alert-monitor`.
-- SQS dry-run commands for configured `aws_sqs` sources, including sanitized `sqs-peek`, `sqs-ingest --dry-run`, `health --source ... --json`, and `dlq-inspect --source ...` output.
-- YAML/env configuration loader with multiple project/channel definitions that keeps tokens out of committed files.
-- SQLite ledger for raw messages, fingerprints, incident mapping, idempotency, and watchdog state.
-- Alert parsing/fingerprinting with stable project-scoped dedupe across noisy metric values.
-- Dry-run synthetic alert flow that produces the planned Kanban card and channel message with zero Telegram/provider/Kanban side effects.
-- Telegram `getUpdates` poll-once helper with persisted offset.
+- SQS commands for configured `aws_sqs` sources: sanitized `sqs-peek`, `sqs-ingest --dry-run`, live `sqs-listen`, `health --source ... --json`, and `dlq-inspect --source ...` output.
+- YAML/env configuration loader with multiple SQS sources, Telegram status sinks, Hermes/Kanban routing, and secret-free examples.
+- SQLite ledger for raw SQS messages, normalized alerts, deterministic event/transition idempotency, incident correlation, PR lifecycle references, and watchdog state.
+- SNS and EventBridge CloudWatch alarm parsers with stable `event_id`, `transition_key`, and `incident_fingerprint` values.
+- Dry-run synthetic/manual alert flow that produces the planned Kanban card and channel message with zero Telegram/provider/Kanban side effects.
+- Telegram `getUpdates` poll-once helper retained only for legacy/fallback manual intake.
 - Standard concise Telegram message templates.
 - Watchdog evaluation for stalled incidents.
 - systemd user unit examples for intake and watchdog.
@@ -143,7 +149,7 @@ stateDiagram-v2
 - Hermes CLI installed and configured on the same host that will run this package. See the Hermes install guide: <https://hermes-agent.nousresearch.com/docs/getting-started/installation>.
 - Hermes Kanban enabled and initialized, with the board slugs and worker profiles named in `config.yaml` already created. See the Kanban guide: <https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban>.
 - Existing dedicated SQS Standard queue and DLQ for alert intake, with queue URL/DLQ URL supplied in local environment variables.
-- Narrow AWS credentials with `sts:GetCallerIdentity`, `sqs:GetQueueAttributes`, `sqs:ReceiveMessage` for inspection, and later `sqs:DeleteMessage`/`sqs:ChangeMessageVisibility` for live consumption.
+- Narrow AWS credentials with `sts:GetCallerIdentity`, `sqs:GetQueueAttributes`, `sqs:ReceiveMessage` for inspection/dry-run, and `sqs:DeleteMessage`/`sqs:ChangeMessageVisibility` for live `sqs-listen` consumption.
 - Telegram status bot token per monitored project. Each status bot must be able to post/read its configured status channel; Telegram intake is legacy/fallback only for SQS-first projects.
 - Optional cloud/provider CLIs configured readonly if debugger workers will inspect logs, metrics, deploys, or traces.
 - Optional: `gh` for release/tag workflows if you use GitHub.
@@ -239,7 +245,7 @@ The wizard asks for and explains how to get:
 - Hermes coordinator profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
 - Hermes Kanban board slug: create/list with `hermes -p <coordinator-profile> kanban boards create <slug>` and `hermes -p <coordinator-profile> kanban boards list`.
 - Incident assignee/debugger profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
-- Optional AWS readonly credentials: if you answer yes, the wizard prompts locally for AWS profile, region, access key id, and secret access key; writes `~/.aws`-style files with restrictive permissions; and validates STS, CloudWatch, and CloudWatch Logs access. The standalone `./scripts/setup-aws-readonly.sh` remains available if you prefer to configure AWS separately.
+- Optional AWS credentials: if you answer yes, the wizard prompts locally for AWS profile, region, access key id, and secret access key; writes `~/.aws`-style files with restrictive permissions; and validates STS, CloudWatch, and CloudWatch Logs access. The standalone `./scripts/setup-aws-readonly.sh` remains available if you prefer to configure AWS separately. For live SQS, add queue consumer permissions to that profile before enabling `sqs-listen`.
 
 As it goes, live mode validates what it can without committing side effects:
 
@@ -256,18 +262,19 @@ The wizard does not paste secrets into the terminal output. It stores entered to
 
 `config.yaml` uses a top-level `projects:` list so one install can monitor multiple independent channels. Each entry controls:
 
-- `slug` and `display_name` for project identity and card titles.
-- `telegram.bot_token_env`, `telegram.alert_chat_id`, and `telegram.offset_path` for the source channel.
+- `slug`, `display_name`, and `environment` for project identity and card titles.
+- `sources[]` for SQS queue URL/ARN env vars, DLQ URL/ARN env vars, AWS region, envelope type, polling limits, and delete policy.
+- `sinks[]` for Telegram status output. Telegram is not the durable source for SQS-first projects.
 - `hermes.coordinator_profile`, `hermes.kanban_board`, and `hermes.channel_target` for local Hermes routing.
 - `kanban.tenant`, `kanban.incident_assignee`, and priorities for generated incident cards.
 - `messages.prefix` for visible channel status/final messages.
 
 Example projects in `config.example.yaml`:
 
-- `sample-api`: API/service alerts routed to `sample-api-incidents` and `debugger`.
-- `worker-queue`: background worker alerts routed to `worker-incidents` and `worker-debugger`.
+- `sample-api`: SQS CloudWatch alert source routed to `sample-api-incidents`, `debugger`, and a Telegram status sink.
+- `worker-queue`: legacy/manual Telegram fallback example routed to `worker-incidents` and `worker-debugger`.
 
-Use `--project <slug>` for synthetic tests or one-off polling of a single project. Omit `--project` for `ingest`/`listen` to process all configured projects.
+Use `--source <source-name>` for SQS health, DLQ inspection, dry-run parsing, and live listening. Use `--project <slug>` only for synthetic/manual fallback commands or legacy Telegram polling. Omit `--project` for legacy `ingest`/`listen` to process all configured fallback projects.
 
 Minimal local smoke test:
 
@@ -287,14 +294,16 @@ The output is JSON. It should include:
 - a planned Kanban card assigned to the selected project's debugger profile
 - a concise project-prefixed `🔎 ... alert monitor` channel message
 
-## Telegram setup
+## Telegram status sink and legacy fallback setup
 
-1. Create a dedicated Telegram listener bot.
-   - If alerts are already posted by a bot, do not reuse that alert-posting bot; Telegram does not deliver a bot's own channel posts through `getUpdates`.
-   - Reuse is only safe when channel alerts are posted by another actor, such as a human account or a different bot.
-2. Add it to the existing application alert channel as an admin.
-3. Put each token in local environment only, using the env var named by that project, such as `ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN=...`.
-4. Clear any existing webhook before polling. For the first live run after dry-run testing, intentionally drop stale pending updates for each project bot so old channel posts are not replayed into real Kanban/status side effects:
+SQS-first projects use Telegram as a human-visible status/final-message sink. Telegram `getUpdates` intake is retained only as a legacy/manual fallback path after SQS live mode is stable.
+
+1. Create a dedicated Telegram status bot.
+   - If you also keep legacy fallback polling, do not reuse a bot that posts the source alerts; Telegram does not deliver a bot's own channel posts through `getUpdates`.
+   - Reuse is only safe when fallback channel alerts are posted by another actor, such as a human account or a different bot.
+2. Add it to the existing application alert/status channel as an admin.
+3. Put each token and chat id in local environment only, using the env vars named by that project's sink, such as `ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN=...` and `ALERT_MONITOR_SAMPLE_API_TELEGRAM_CHAT_ID=...`.
+4. If you temporarily use legacy Telegram polling, clear any existing webhook first. For the first non-dry fallback run after dry-run testing, intentionally drop stale pending updates for each project bot so old channel posts are not replayed into real Kanban/status side effects:
 
    ```bash
    python - <<'PY'
@@ -322,9 +331,9 @@ The output is JSON. It should include:
    ```
 
    `getWebhookInfo` should report an empty `url`; otherwise Telegram will reject `getUpdates` polling with a webhook conflict.
-5. For every `projects[]` entry, set `telegram.alert_chat_id`, `hermes.channel_target`, `hermes.kanban_board`, `kanban.tenant`, `kanban.incident_assignee`, and `messages.prefix` in `config.yaml`. Use Hermes board slugs such as `sample-api-incidents`, not SQLite database paths.
-6. Run a dry-run synthetic alert for each project before enabling non-dry behavior.
-7. If you cannot drop pending updates because you need the backlog for investigation, prime each project's offset intentionally before live mode: page through Telegram `getUpdates` until no pending updates remain, inspect every returned page, and write the configured `telegram.offset_path` in the agent's expected JSON format, for example `{ "offset": 12346 }`, where the value is one greater than the highest inspected `update_id`. Only start non-dry `listen` after every project offset file is in place.
+5. For every SQS-first `projects[]` entry, set `sinks[].chat_id_env`, `hermes.channel_target`, `hermes.kanban_board`, `kanban.tenant`, `kanban.incident_assignee`, and `messages.prefix` in `config.yaml`. Use Hermes board slugs such as `sample-api-incidents`, not SQLite database paths. For legacy fallback projects, also set `telegram.alert_chat_id` and `telegram.offset_path`.
+6. Run an SQS health check and `sqs-ingest --dry-run` for each SQS source before enabling `sqs-listen`.
+7. If you cannot drop pending Telegram updates because you need the legacy fallback backlog for investigation, prime each project's offset intentionally before fallback live mode: page through `getUpdates` until no pending updates remain, inspect every returned page, and write the configured `telegram.offset_path` in the agent's expected JSON format, for example `{ "offset": 12346 }`, where the value is one greater than the highest inspected `update_id`. Only start non-dry legacy `listen` after every fallback project offset file is in place.
 
 This design uses local polling/listening. It does not require public webhooks, ngrok, reverse SSH tunnels, or inbound router/NAT changes.
 
@@ -339,9 +348,14 @@ Recommended profile split per project:
 
 The local poller can create Kanban cards through the Hermes CLI in non-dry mode. Before enabling live mode, verify every configured coordinator profile exists and can create cards on its configured board slug. Agent workers should still prefer native Kanban tools when already running inside Hermes.
 
-## Optional provider readonly credentials
+## AWS queue consumer and diagnostic credentials
 
-Use readonly credentials only. The main setup wizard can collect AWS credentials directly:
+The local agent needs two permission groups:
+
+- Queue consumer permissions on the dedicated intake queue/DLQ. These are narrowly scoped, but live mode is not read-only because it must delete successfully processed SQS messages.
+- Diagnostic read permissions for debugger workers to inspect CloudWatch alarms, metrics, and logs.
+
+The setup wizard can collect AWS credentials directly:
 
 ```bash
 ./scripts/setup-interactive.sh
@@ -351,8 +365,8 @@ When prompted for AWS setup, provide:
 
 - AWS config directory, usually `~/.aws`
 - AWS profile name: on a fresh dedicated assistant VM the wizard suggests `default` so Hermes workers can read CloudWatch credentials without extra environment propagation; if an existing default profile is present, it suggests `alert-monitor-readonly` instead.
-- AWS region, for example `sa-east-1` or `us-east-1`
-- AWS access key id for a dedicated readonly IAM user
+- AWS region, for TicketDoVale usually `sa-east-1`
+- AWS access key id for a dedicated IAM user
 - AWS secret access key for that same IAM user, entered hidden
 
 Use this credential type:
@@ -362,19 +376,7 @@ Use this credential type:
 - No console password needed
 - No AWS SSO/role profile for the wizard path; the wizard intentionally writes static profile credentials and clears stale session-token/role/SSO fields for that profile.
 
-How to create the credentials in AWS Console:
-
-1. Open **IAM → Policies → Create policy → JSON**.
-2. Paste the policy below and create it as something like `AgentAlertMonitorCloudWatchReadOnly`.
-3. Open **IAM → Users → Create user**.
-4. Name it something like `agent-alert-monitor-readonly`.
-5. Do **not** enable console access.
-6. Attach the policy from step 2 directly or through a group.
-7. Open the new user → **Security credentials → Create access key**.
-8. Choose **Command Line Interface (CLI)** or **Other** as the use case.
-9. Copy the access key id and secret once, then paste them only into the local wizard prompt.
-
-Minimum IAM policy for CloudWatch/Logs debugging:
+Minimum IAM policy shape for SQS intake plus CloudWatch/Logs debugging:
 
 ```json
 {
@@ -387,12 +389,35 @@ Minimum IAM policy for CloudWatch/Logs debugging:
       "Resource": "*"
     },
     {
+      "Sid": "ConsumeAgentAlertQueue",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": "arn:aws:sqs:<region>:<account-id>:agent-alert-monitor-ticketdovale-prod"
+    },
+    {
+      "Sid": "InspectAgentAlertDlq",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:ReceiveMessage"
+      ],
+      "Resource": "arn:aws:sqs:<region>:<account-id>:agent-alert-monitor-ticketdovale-prod-dlq"
+    },
+    {
       "Sid": "CloudWatchReadOnly",
       "Effect": "Allow",
       "Action": [
         "cloudwatch:DescribeAlarms",
+        "cloudwatch:DescribeAlarmHistory",
         "cloudwatch:GetMetricData",
-        "cloudwatch:GetMetricStatistics"
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics"
       ],
       "Resource": "*"
     },
@@ -403,7 +428,10 @@ Minimum IAM policy for CloudWatch/Logs debugging:
         "logs:DescribeLogGroups",
         "logs:DescribeLogStreams",
         "logs:FilterLogEvents",
-        "logs:GetLogEvents"
+        "logs:GetLogEvents",
+        "logs:StartQuery",
+        "logs:GetQueryResults",
+        "logs:StopQuery"
       ],
       "Resource": "*"
     }
@@ -411,13 +439,19 @@ Minimum IAM policy for CloudWatch/Logs debugging:
 }
 ```
 
+Routine DLQ inspection does not need redrive permissions. Grant redrive/replay permissions only to an operator role used for recovery.
+
 The wizard validates only:
 
 - `aws sts get-caller-identity`
 - `aws cloudwatch describe-alarms`
 - `aws logs describe-log-groups`
 
-The extra metric/log read permissions are for debugger workers to inspect incidents after setup succeeds.
+The SQS health command validates queue and DLQ access after `config.yaml` and queue env vars are in place:
+
+```bash
+agent-alert-monitor --config config.yaml health --source ticketdovale-prod-alerts --json
+```
 
 The wizard writes `credentials` and `config` with `0600`, exports `AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_SHARED_CREDENTIALS_FILE`, and `AWS_CONFIG_FILE` into local `.env`, then validates STS, CloudWatch, and CloudWatch Logs. The standalone helper script is also available:
 
@@ -474,15 +508,18 @@ python -m pytest -q
 # Lint if ruff is installed
 python -m ruff check .
 
-# SQS health and DLQ inspection
+# SQS health, dry-run parsing, DLQ inspection, and live consumption
 agent-alert-monitor --config config.yaml health --source sample-api-prod-alerts --json
+agent-alert-monitor --config config.yaml sqs-peek --source sample-api-prod-alerts --max-messages 10
+agent-alert-monitor --config config.yaml sqs-ingest --source sample-api-prod-alerts --dry-run
 agent-alert-monitor --config config.yaml dlq-inspect --source sample-api-prod-alerts --max-messages 10
+agent-alert-monitor --config config.yaml sqs-listen --source sample-api-prod-alerts --once
 
-# Legacy Telegram dry-run synthetic alert
+# Legacy/manual Telegram dry-run synthetic alert
 agent-alert-monitor --config config.yaml --project sample-api synthetic-alert --text 'ALARM: Service5xx service=api' --dry-run
 
-# Legacy Telegram polling without creating cards
-agent-alert-monitor --config config.yaml ingest --dry-run  # all configured projects
+# Legacy Telegram fallback polling without creating cards
+agent-alert-monitor --config config.yaml ingest --dry-run  # all configured fallback projects
 agent-alert-monitor --config config.yaml --project worker-queue ingest --dry-run
 
 # Print watchdog findings as JSON
@@ -493,7 +530,7 @@ agent-alert-monitor --config config.yaml incident-update \
   --incident t_example --status resolved --last-channel-status final
 ```
 
-`incident-update --status done|closed|resolved` intentionally requires `--last-channel-status final` (or an already-recorded final status) so local ledger closure cannot silently bypass the channel outcome and watchdog path.
+Manual `incident-update --status done|closed|resolved` intentionally requires `--last-channel-status final` (or an already-recorded final status) so legacy/manual ledger closure cannot silently bypass the channel outcome and watchdog path. Live SQS recovery still treats Telegram status as best-effort after required ledger/Kanban side effects succeed.
 
 ## Security model
 
@@ -507,11 +544,14 @@ agent-alert-monitor --config config.yaml incident-update \
 
 ## Troubleshooting
 
-- No Telegram updates: confirm the bot is channel admin and the channel id matches the selected project's `telegram.alert_chat_id`.
-- Token error: ensure the project's configured `telegram.bot_token_env` is exported in the same environment running the service.
-- Duplicate incidents: inspect the fingerprint in `ledger.sqlite`; fingerprints are scoped by project, and alerts with different alarm/service/region/env intentionally become different incidents.
+- SQS source health fails: verify queue URL/ARN env vars, region, AWS profile, and `sqs:GetQueueAttributes` permissions before receiving messages.
+- `sqs-ingest --dry-run` shows parse failures: confirm the configured `envelope` matches the producer path (`aws_sns_cloudwatch_alarm` vs `aws_eventbridge_cloudwatch_alarm`).
+- DLQ has messages: run `dlq-inspect`, fix parser/config or producer shape, then redrive only after an operator decision.
+- Telegram status missing: confirm the status bot is channel admin and the chat id matches the selected sink env var. Do not treat this as intake loss; SQS remains the source of truth.
+- Token error: ensure the configured Telegram sink `bot_token_env` is exported in the same environment running the service.
+- Duplicate incidents: inspect `event_id`, `transition_key`, and `incident_fingerprint` in `ledger.sqlite`; fingerprints are scoped by project and alert source.
 - Silent incident: run `agent-alert-monitor --config config.yaml watchdog-due` and check whether `last_channel_post_at` is being updated.
-- Kanban card not created in non-dry mode: verify Hermes CLI auth/profile can run `hermes kanban create` manually.
+- Kanban card not created in live SQS mode: verify Hermes CLI auth/profile can run `hermes kanban create` manually on the configured board.
 
 ## Versioning and upgrades
 

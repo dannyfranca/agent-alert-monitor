@@ -1,23 +1,15 @@
+# Example config for SQS-first agent-alert-monitor.
+# Copy to config.yaml and keep secrets in .env/local environment only.
+
 runtime:
   state_dir: "${ALERT_MONITOR_STATE_DIR}"
   ledger_path: "${ALERT_MONITOR_STATE_DIR}/ledger.sqlite"
 
-watchdog:
-  ack_sla_seconds: 120
-  progress_sla_seconds: 600
-  stalled_after_seconds: 900
-
-# One install can monitor several independent projects. Each SQS-first project has
-# one or more cloud queue sources, Telegram status sinks, Hermes profile/board
-# routing, Kanban tenant/assignee, and channel message prefix. Secrets are still
-# referenced by env var name only.
 default_project: sample-api
+
 projects:
   - slug: sample-api
     display_name: Sample API
-    environment: prod
-    # v2 SQS-first alert intake. Keep Telegram as a sink/status channel; do
-    # not use Telegram as the source of truth for cloud alert records.
     sources:
       - name: sample-api-prod-alerts
         type: aws_sqs
@@ -38,8 +30,7 @@ projects:
         chat_id_env: ALERT_MONITOR_SAMPLE_API_TELEGRAM_CHAT_ID
     hermes:
       coordinator_profile: alert-coordinator
-      # Hermes Kanban board slug. The board and coordinator profile must exist before live mode.
-      kanban_board: "sample-api-incidents"
+      kanban_board: sample-api-incidents
       channel_target: "telegram:${ALERT_MONITOR_SAMPLE_API_TELEGRAM_CHAT_ID}"
     kanban:
       incident_assignee: debugger
@@ -49,12 +40,10 @@ projects:
     messages:
       prefix: Sample API alert monitor
 
-  # TicketDoVale production should use the dedicated queue values supplied by the
-  # cloud operator, not Telegram channel history. Uncomment and adapt after the
-  # ticketdovale queue URL/ARN/DLQ outputs and status chat are available.
+  # Replace this commented project with the real cloud-operator-provided
+  # Ticket do Vale queue URL/ARN/DLQ outputs when available.
   # - slug: ticketdovale
-  #   display_name: TicketDoVale
-  #   environment: prod
+  #   display_name: Ticket do Vale
   #   sources:
   #     - name: ticketdovale-prod-alerts
   #       type: aws_sqs
@@ -75,33 +64,17 @@ projects:
   #       chat_id_env: ALERT_MONITOR_TICKETDOVALE_TELEGRAM_CHAT_ID
   #   hermes:
   #     coordinator_profile: alert-coordinator
-  #     kanban_board: "ticketdovale-incidents"
+  #     kanban_board: ticketdovale-incidents
   #     channel_target: "telegram:${ALERT_MONITOR_TICKETDOVALE_TELEGRAM_CHAT_ID}"
   #   kanban:
   #     incident_assignee: debugger
-  #     coder_assignee: coder
-  #     reviewer_assignee: reviewer
   #     tenant: ticketdovale
   #     default_priority: 1000
   #     critical_priority: 2000
   #   messages:
-  #     prefix: TicketDoVale alert monitor
+  #     prefix: Ticket do Vale alert monitor
 
-  - slug: worker-queue
-    display_name: Worker Queue
-    telegram:
-      bot_token_env: ALERT_MONITOR_WORKER_QUEUE_TELEGRAM_BOT_TOKEN
-      alert_chat_id: "<WORKER_QUEUE_ALERT_CHANNEL_ID>"
-      poll_interval_seconds: 10
-      offset_path: "${ALERT_MONITOR_STATE_DIR}/worker-queue-telegram-offset.json"
-    hermes:
-      coordinator_profile: worker-alert-coordinator
-      kanban_board: "worker-incidents"
-      channel_target: "telegram:<WORKER_QUEUE_ALERT_CHANNEL_ID>"
-    kanban:
-      incident_assignee: worker-debugger
-      tenant: worker-queue
-      default_priority: 900
-      critical_priority: 1900
-    messages:
-      prefix: Worker Queue alert monitor
+watchdog:
+  ack_sla_seconds: 120
+  progress_sla_seconds: 600
+  stalled_after_seconds: 900

@@ -30,7 +30,6 @@ replacements = {
 }
 
 for unit in [
-    "agent-alert-monitor-ingest.service",
     "agent-alert-monitor-watchdog.service",
     "agent-alert-monitor-watchdog.timer",
     "agent-alert-monitor-sqs-readiness.service",
@@ -43,6 +42,12 @@ for unit in [
         rendered = rendered.replace(placeholder, value)
     (unit_dir / unit).write_text(rendered, encoding="utf-8")
 PY
+
+legacy_unit="$UNIT_DIR/agent-alert-monitor-ingest.service"
+if systemctl --user list-unit-files --no-legend 'agent-alert-monitor-ingest.service' | grep -q '^agent-alert-monitor-ingest.service'; then
+  systemctl --user disable --now agent-alert-monitor-ingest.service >/dev/null 2>&1 || true
+fi
+rm -f "$legacy_unit"
 
 systemctl --user daemon-reload
 printf 'Installed units under %s for repo %s.\n' "$UNIT_DIR" "$ROOT"

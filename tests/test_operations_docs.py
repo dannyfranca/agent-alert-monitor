@@ -5,7 +5,6 @@ from pathlib import Path
 
 def test_systemd_units_persist_hermes_cli_path_for_live_mode() -> None:
     for unit_path in [
-        Path("systemd/agent-alert-monitor-ingest.service"),
         Path("systemd/agent-alert-monitor-watchdog.service"),
         Path("systemd/agent-alert-monitor-sqs-readiness.service"),
         Path("systemd/agent-alert-monitor-sqs-listen.service"),
@@ -47,24 +46,45 @@ def test_live_mode_docs_include_systemd_hermes_path_smoke_test() -> None:
     assert "%h/.local/bin" in env_example
 
 
-def test_operations_docs_require_backlog_drop_or_offset_priming_before_live_listen() -> None:
+def test_operations_docs_require_sqs_health_and_dry_run_before_live_listen() -> None:
     text = Path("docs/operations.md").read_text(encoding="utf-8")
     non_dry_section = text.split("## Non-dry intake", maxsplit=1)[1]
     non_dry_section = non_dry_section.split("## Watchdog", maxsplit=1)[0]
 
-    assert "drop_pending_updates" in non_dry_section
-    assert "deleteWebhook" in non_dry_section
-    assert "prime" in non_dry_section.lower()
-    assert "offset" in non_dry_section.lower()
-    paragraphs = [paragraph.lower() for paragraph in non_dry_section.split("\n\n")]
-    assert any(
-        "listen" in paragraph
-        and "pending updates" in paragraph
-        and "dropped" in paragraph
-        and "offset" in paragraph
-        and "primed" in paragraph
-        for paragraph in paragraphs
-    )
+    assert "agent-alert-monitor --config config.yaml health --source" in non_dry_section
+    assert "agent-alert-monitor --config config.yaml sqs-ingest --source" in non_dry_section
+    assert "sqs-listen" in non_dry_section
+    assert "Telegram status sink" in non_dry_section
+    assert "getUpdates" not in non_dry_section
+    assert "deleteWebhook" not in non_dry_section
+
+
+def test_operator_docs_do_not_reference_removed_telegram_intake_paths() -> None:
+    docs = [
+        Path("README.md"),
+        Path("docs/architecture.md"),
+        Path("docs/operations.md"),
+        Path("docs/kanban-flow.md"),
+        Path("config.example.yaml"),
+        Path(".env.example"),
+    ]
+    forbidden = [
+        "getUpdates",
+        "deleteWebhook",
+        "drop_pending_updates",
+        "legacy/fallback",
+        "legacy fallback",
+        "legacy/manual",
+        "Telegram fallback",
+        "telegram.offset_path",
+        "synthetic-alert",
+        "agent-alert-monitor ingest",
+        "agent-alert-monitor listen",
+    ]
+    for path in docs:
+        text = path.read_text(encoding="utf-8")
+        for phrase in forbidden:
+            assert phrase not in text, f"{phrase!r} found in {path}"
 
 
 def test_operations_docs_cover_sqs_health_dlq_retention_and_replay() -> None:
@@ -82,4 +102,4 @@ def test_operations_docs_cover_sqs_health_dlq_retention_and_replay() -> None:
     assert "14-day" in sqs_section
     assert "EventBridge archive" in sqs_section
     assert "replay" in sqs_section.lower()
-    assert "Telegram" in sqs_section and "legacy/fallback" in sqs_section
+    assert "Telegram" in sqs_section and "visible status sink" in sqs_section

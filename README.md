@@ -2,7 +2,7 @@
 
 Local SQS-to-Hermes Kanban incident coordinator for configured cloud alert queues, with Telegram retained as a human-visible status sink.
 
-This project consumes CloudWatch/SNS/EventBridge alert payloads from a dedicated SQS queue, records every alert in a local SQLite ledger, correlates related alerts per configured project, plans or creates high-priority Kanban incident cards, and emits concise Telegram status messages so failures do not disappear silently. Telegram intake remains available only as a legacy/fallback manual path; SQS is the target source of truth for durable alert intake.
+This project consumes CloudWatch/SNS/EventBridge alert payloads from a dedicated SQS queue, records every alert in a local SQLite ledger, correlates related alerts per configured project, plans or creates high-priority Kanban incident cards, and emits concise Telegram status messages so failures do not disappear silently. SQS is the only durable intake path; Telegram is used only for human-visible status output.
 
 Version: `0.1.0`.
 License: MIT.
@@ -25,7 +25,7 @@ Core principle:
 
 ```text
 SQS queue = cloud-durable alert intake boundary
-Telegram session = human-visible status mirror and legacy/fallback manual intake
+Telegram session = human-visible status mirror only
 Alert ledger = durable local dedupe/recovery state
 Kanban = execution state and multi-agent fan-out
 Watchdog = no-silence guarantee
@@ -137,7 +137,6 @@ stateDiagram-v2
 - SQLite ledger for raw SQS messages, normalized alerts, deterministic event/transition idempotency, incident correlation, PR lifecycle references, and watchdog state.
 - SNS and EventBridge CloudWatch alarm parsers with stable `event_id`, `transition_key`, and `incident_fingerprint` values.
 - Dry-run synthetic/manual alert flow that produces the planned Kanban card and channel message with zero Telegram/provider/Kanban side effects.
-- Telegram `getUpdates` poll-once helper retained only for legacy/fallback manual intake.
 - Standard concise Telegram message templates.
 - Watchdog evaluation for stalled incidents.
 - systemd user unit examples for intake and watchdog.
@@ -150,13 +149,13 @@ stateDiagram-v2
 - Hermes Kanban enabled and initialized, with the board slugs and worker profiles named in `config.yaml` already created. See the Kanban guide: <https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban>.
 - Existing dedicated SQS Standard queue and DLQ for alert intake, with queue URL/DLQ URL supplied in local environment variables.
 - Narrow AWS credentials with `sts:GetCallerIdentity`, `sqs:GetQueueAttributes`, `sqs:ReceiveMessage` for inspection/dry-run, and `sqs:DeleteMessage`/`sqs:ChangeMessageVisibility` for live `sqs-listen` consumption.
-- Telegram status bot token per monitored project. Each status bot must be able to post/read its configured status channel; Telegram intake is legacy/fallback only for SQS-first projects.
+- Telegram status bot token per monitored project. Each status bot must be able to post/read its configured status channel; it is not used as an alert intake source.
 - Optional cloud/provider CLIs configured readonly if debugger workers will inspect logs, metrics, deploys, or traces.
 - Optional: `gh` for release/tag workflows if you use GitHub.
 
 ## Hermes and Kanban live-mode prerequisite setup
 
-`scripts/install.sh` installs only this Python package into `.venv`; it does not install or configure Hermes. For the clone → install → dry-run evaluation path, you can skip this section temporarily and use the local dry-run commands below. Live `ingest`/`listen` shells out to the local `hermes` CLI to create Kanban incident cards, so complete these prerequisites before you disable `--dry-run`.
+`scripts/install.sh` installs only this Python package into `.venv`; it does not install or configure Hermes. For the clone → install → dry-run evaluation path, you can skip this section temporarily and use the local dry-run commands below. Live `sqs-listen` shells out to the local `hermes` CLI to create Kanban incident cards, so complete these prerequisites before you disable `--dry-run`.
 
 Generic setup path:
 
@@ -240,8 +239,8 @@ agent-alert-monitor setup --root .                 # same wizard after activatin
 
 The wizard asks for and explains how to get:
 
-- Telegram listener bot token: create a dedicated bot with `@BotFather` using `/newbot`.
-- Telegram alert channel id: add the listener bot as a channel admin, post a test alert, then run the wizard's env-based `getUpdates`/cleanup snippets and copy `chat.id` without pasting the token into chat, browser history, or shell history.
+- Telegram status bot token: create a dedicated bot with `@BotFather` using `/newbot`.
+- Telegram status channel id: add the status bot as a channel admin and copy the numeric channel `chat.id` without pasting the token into chat, browser history, or shell history.
 - Hermes coordinator profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
 - Hermes Kanban board slug: create/list with `hermes -p <coordinator-profile> kanban boards create <slug>` and `hermes -p <coordinator-profile> kanban boards list`.
 - Incident assignee/debugger profile: create/configure with `hermes profile create <name>` and `hermes -p <name> setup`.
@@ -272,16 +271,16 @@ The wizard does not paste secrets into the terminal output. It stores entered to
 Example projects in `config.example.yaml`:
 
 - `sample-api`: SQS CloudWatch alert source routed to `sample-api-incidents`, `debugger`, and a Telegram status sink.
-- `worker-queue`: legacy/manual Telegram fallback example routed to `worker-incidents` and `worker-debugger`.
+- Add additional projects only when each has a dedicated SQS source and Telegram status sink.
 
-Use `--source <source-name>` for SQS health, DLQ inspection, dry-run parsing, and live listening. Use `--project <slug>` only for synthetic/manual fallback commands or legacy Telegram polling. Omit `--project` for legacy `ingest`/`listen` to process all configured fallback projects.
+Use `--source <source-name>` for SQS health, DLQ inspection, dry-run parsing, and live listening. Use `--project <slug>` for project-scoped manual alert dry-runs and incident updates.
 
 Minimal local smoke test:
 
 ```bash
 source .venv/bin/activate
 set -a; . ./.env; set +a
-agent-alert-monitor --config config.yaml --project sample-api synthetic-alert \
+agent-alert-monitor --config config.yaml --project sample-api manual-alert \
   --message-id synthetic-1 \
   --text 'CRITICAL ALARM: Service5xx service=api region=us-east-1' \
   --dry-run
@@ -294,48 +293,17 @@ The output is JSON. It should include:
 - a planned Kanban card assigned to the selected project's debugger profile
 - a concise project-prefixed `🔎 ... alert monitor` channel message
 
-## Telegram status sink and legacy fallback setup
+## Telegram status sink setup
 
-SQS-first projects use Telegram as a human-visible status/final-message sink. Telegram `getUpdates` intake is retained only as a legacy/manual fallback path after SQS live mode is stable.
+SQS-first projects use Telegram as a human-visible status/final-message sink. Telegram is not an alert intake source.
 
 1. Create a dedicated Telegram status bot.
-   - If you also keep legacy fallback polling, do not reuse a bot that posts the source alerts; Telegram does not deliver a bot's own channel posts through `getUpdates`.
-   - Reuse is only safe when fallback channel alerts are posted by another actor, such as a human account or a different bot.
 2. Add it to the existing application alert/status channel as an admin.
-3. Put each token and chat id in local environment only, using the env vars named by that project's sink, such as `ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN=...` and `ALERT_MONITOR_SAMPLE_API_TELEGRAM_CHAT_ID=...`.
-4. If you temporarily use legacy Telegram polling, clear any existing webhook first. For the first non-dry fallback run after dry-run testing, intentionally drop stale pending updates for each project bot so old channel posts are not replayed into real Kanban/status side effects:
+3. Put each token and chat id in local environment only, using the env vars named by that project's sink, such as `ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN=***` and `ALERT_MONITOR_SAMPLE_API_TELEGRAM_CHAT_ID=...`.
+4. For every `projects[]` entry, set `sources[]`, `sinks[]`, `hermes.channel_target`, `hermes.kanban_board`, `kanban.tenant`, `kanban.incident_assignee`, and `messages.prefix` in `config.yaml`. Use Hermes board slugs such as `sample-api-incidents`, not SQLite database paths.
+5. Run an SQS health check and `sqs-ingest --dry-run` for each SQS source before enabling `sqs-listen`.
 
-   ```bash
-   python - <<'PY'
-   from urllib.parse import urlencode
-   from urllib.request import urlopen
-   import json, os
-
-   token_envs = [
-       "ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN",
-       "ALERT_MONITOR_WORKER_QUEUE_TELEGRAM_BOT_TOKEN",
-   ]
-   for token_env in token_envs:
-       token = os.environ[token_env]
-       base = f"https://api.telegram.org/bot{token}"
-       print(f"# {token_env}")
-       for path, query in [
-           ("deleteWebhook", {"drop_pending_updates": "true"}),
-           ("getWebhookInfo", {}),
-       ]:
-           url = f"{base}/{path}"
-           if query:
-               url = f"{url}?{urlencode(query)}"
-           print(json.dumps(json.load(urlopen(url, timeout=15)), indent=2))
-   PY
-   ```
-
-   `getWebhookInfo` should report an empty `url`; otherwise Telegram will reject `getUpdates` polling with a webhook conflict.
-5. For every SQS-first `projects[]` entry, set `sinks[].chat_id_env`, `hermes.channel_target`, `hermes.kanban_board`, `kanban.tenant`, `kanban.incident_assignee`, and `messages.prefix` in `config.yaml`. Use Hermes board slugs such as `sample-api-incidents`, not SQLite database paths. For legacy fallback projects, also set `telegram.alert_chat_id` and `telegram.offset_path`.
-6. Run an SQS health check and `sqs-ingest --dry-run` for each SQS source before enabling `sqs-listen`.
-7. If you cannot drop pending Telegram updates because you need the legacy fallback backlog for investigation, prime each project's offset intentionally before fallback live mode: page through `getUpdates` until no pending updates remain, inspect every returned page, and write the configured `telegram.offset_path` in the agent's expected JSON format, for example `{ "offset": 12346 }`, where the value is one greater than the highest inspected `update_id`. Only start non-dry legacy `listen` after every fallback project offset file is in place.
-
-This design uses local polling/listening. It does not require public webhooks, ngrok, reverse SSH tunnels, or inbound router/NAT changes.
+This design uses local SQS long polling/listening. It does not require public webhooks, ngrok, reverse SSH tunnels, or inbound router/NAT changes.
 
 ## Hermes profile assumptions
 
@@ -515,12 +483,8 @@ agent-alert-monitor --config config.yaml sqs-ingest --source sample-api-prod-ale
 agent-alert-monitor --config config.yaml dlq-inspect --source sample-api-prod-alerts --max-messages 10
 agent-alert-monitor --config config.yaml sqs-listen --source sample-api-prod-alerts --once
 
-# Legacy/manual Telegram dry-run synthetic alert
-agent-alert-monitor --config config.yaml --project sample-api synthetic-alert --text 'ALARM: Service5xx service=api' --dry-run
-
-# Legacy Telegram fallback polling without creating cards
-agent-alert-monitor --config config.yaml ingest --dry-run  # all configured fallback projects
-agent-alert-monitor --config config.yaml --project worker-queue ingest --dry-run
+# Manual alert dry-run
+agent-alert-monitor --config config.yaml --project sample-api manual-alert --text 'ALARM: Service5xx service=api' --dry-run
 
 # Print watchdog findings as JSON
 agent-alert-monitor --config config.yaml watchdog-due
@@ -530,7 +494,7 @@ agent-alert-monitor --config config.yaml incident-update \
   --incident t_example --status resolved --last-channel-status final
 ```
 
-Manual `incident-update --status done|closed|resolved` intentionally requires `--last-channel-status final` (or an already-recorded final status) so legacy/manual ledger closure cannot silently bypass the channel outcome and watchdog path. Live SQS recovery still treats Telegram status as best-effort after required ledger/Kanban side effects succeed.
+Manual `incident-update --status done|closed|resolved` intentionally requires `--last-channel-status final` (or an already-recorded final status) so manual ledger closure cannot silently bypass the channel outcome and watchdog path. Live SQS recovery still treats Telegram status as best-effort after required ledger/Kanban side effects succeed.
 
 ## Security model
 

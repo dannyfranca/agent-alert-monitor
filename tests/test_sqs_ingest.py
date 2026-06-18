@@ -732,6 +732,35 @@ def test_sqs_listen_live_success_creates_incident_and_deletes_after_side_effects
     assert effect["status"] == "succeeded"
 
 
+def test_sqs_listen_uses_default_telegram_status_sender(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _live_cfg(tmp_path)
+    ledger = AlertLedger(cfg.runtime.ledger_path)
+    client = RecordingSqsClient(_fixture("aws_sqs_receive_message_sns_envelope.json"))
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(config, text: str) -> None:
+        sent.append((config.project_slug, text))
+
+    monkeypatch.setattr("agent_alert_monitor.sqs_ingest.send_telegram_message", fake_send)
+
+    result = listen_for_sqs_messages(
+        cfg,
+        source_name="ticketdovale-prod-alerts",
+        ledger=ledger,
+        kanban_client=FakeKanbanClient(),
+        client=client,
+        preflight=_preflight_ok,
+        once=True,
+    )
+
+    assert result["messages"][0]["action"] == "opened"
+    assert sent
+    assert sent[0][0] == "ticketdovale"
+    assert "t_fake_1" in sent[0][1]
+
+
 def test_sqs_listen_redelivery_after_success_does_not_duplicate_card(tmp_path: Path) -> None:
     cfg = _live_cfg(tmp_path)
     ledger = AlertLedger(cfg.runtime.ledger_path)

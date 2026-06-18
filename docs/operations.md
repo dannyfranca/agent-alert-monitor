@@ -9,34 +9,25 @@ cp config.example.yaml config.yaml
 # edit .env and config.yaml locally
 source .venv/bin/activate
 set -a; . ./.env; set +a
-agent-alert-monitor --config config.yaml --project sample-api synthetic-alert --text 'CRITICAL ALARM: Service5xx service=api' --dry-run
-agent-alert-monitor --config config.yaml --project worker-queue synthetic-alert --text 'ALARM: QueueDepth service=worker' --dry-run
+agent-alert-monitor --config config.yaml --project sample-api manual-alert --text 'CRITICAL ALARM: Service5xx service=api' --dry-run
+agent-alert-monitor --config config.yaml health --source sample-api-prod-alerts --json
+agent-alert-monitor --config config.yaml sqs-ingest --source sample-api-prod-alerts --dry-run
 ```
 
 ## Non-dry intake
 
-Start with dry-run polling until Telegram filtering and planned output look correct:
+Do not enable live `sqs-listen` until the configured SQS source has passed the non-receiving health check and a dry-run parse check:
 
 ```bash
-# Poll all configured projects once without Telegram/Kanban side effects.
-agent-alert-monitor --config config.yaml ingest --dry-run
-
-# Or poll one project only.
-agent-alert-monitor --config config.yaml --project sample-api ingest --dry-run
+agent-alert-monitor --config config.yaml health --source sample-api-prod-alerts --json
+agent-alert-monitor --config config.yaml sqs-ingest --source sample-api-prod-alerts --dry-run
 ```
 
-Do not switch from dry-run polling directly to non-dry `listen`. Dry-run mode does not write the configured project offset files, so Telegram can still have old pending `getUpdates` items that would be replayed into real Kanban cards and alert-channel status messages.
-
-Before enabling the non-dry `listen` service, do one of these backlog-safety steps for every configured project:
-
-1. Preferred first live run: clear the polling backlog with Telegram `deleteWebhook(drop_pending_updates=true)` for that project's bot token and confirm `getWebhookInfo` has an empty webhook URL, as shown in the README Telegram setup.
-2. If the backlog must be preserved for investigation: explicitly prime the configured offset. Page through `getUpdates` until no pending updates remain, inspect each page, and write the project's `telegram.offset_path` with an offset one greater than the highest inspected `update_id` (for example `{ "offset": 12346 }`).
-
-Only enable non-dry `listen` after pending updates are dropped or every project offset is intentionally primed.
+Only enable non-dry `sqs-listen` after the queue source, Hermes coordinator profile, Kanban board, debugger assignee, and Telegram status sink are verified.
 
 ## SQS-first intake operations
 
-SQS is the target source of truth for cloud alert intake. Telegram remains useful as the visible status sink and as a legacy/fallback manual intake path while SQS stabilizes; do not treat Telegram channel history as durable intake state for new SQS-first projects.
+SQS is the source of truth for cloud alert intake. Telegram is only a visible status sink; do not treat Telegram channel history as durable intake state for this project.
 
 ### Cloud-side prerequisite boundary
 
@@ -260,6 +251,6 @@ sqlite3 "$ALERT_MONITOR_STATE_DIR/ledger.sqlite" 'select incident_task_id,status
 - Confirm each SQS source has queue URL/ARN, DLQ URL/ARN, region, and envelope type configured.
 - Confirm AWS credentials can run `sts:GetCallerIdentity` and access the intake queue/DLQ attributes before receiving messages.
 - Confirm each Telegram status bot is channel admin and that the configured sink chat id env var is present in the service environment.
-- Confirm legacy fallback projects still define `telegram.bot_token_env`, `telegram.alert_chat_id`, and `telegram.offset_path` if you intentionally use Telegram polling.
+- Confirm Telegram status sinks define `bot_token_env` and `chat_id`/`chat_id_env`, and that the bot can post to the configured channel.
 - Confirm each Hermes coordinator profile can create a manual card on its configured board before enabling live SQS operation.
 - Confirm any provider/cloud readonly smoke commands pass for debugger workers.

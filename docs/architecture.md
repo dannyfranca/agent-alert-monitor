@@ -2,7 +2,7 @@
 
 `agent-alert-monitor` uses an SQS-first intake model. CloudWatch alarm state changes are delivered to an existing dedicated SQS queue, the local Hermes VM polls that queue, and SQLite is the durable local ledger for raw events, normalized alerts, transitions, incidents, and workflow references.
 
-Telegram is an output/status sink and a clearly labeled legacy/manual fallback path. It is not the source of truth for intake, deduplication, recovery correlation, or incident lifecycle decisions.
+Telegram is an output/status sink only. It is not the source of truth for intake, deduplication, recovery correlation, or incident lifecycle decisions.
 
 ## Source-of-truth boundary
 
@@ -27,7 +27,7 @@ The dedicated SQS queue is the cloud-durable intake boundary. Anything before th
 - SQLite ledger: local source of truth for raw events, deterministic idempotency, transition history, incident state, PR references, and channel evidence.
 - Hermes Kanban: execution queue for debugger/coder/reviewer profiles.
 - Telegram sink: status/final-message output channel for humans.
-- Legacy Telegram fallback: manual-test/backstop intake only; do not use it for durable alert routing once SQS live mode is stable.
+- Manual alert dry-runs: local project-scoped tests only; do not use them as durable alert routing.
 
 ## No-public-endpoint design
 
@@ -73,7 +73,7 @@ DLQ redrive is an operator action, not an automatic local-agent behavior. Inspec
 
 ## Ledger v2 assumptions
 
-This project is not live yet, so the v2 ledger optimizes for the final SQS-first target instead of preserving a smooth migration from the older Telegram-first prototype. If `AlertLedger` opens an incompatible older local table shape, it recreates that local table in the current v2/manual-fallback shape rather than carrying forward compatibility-only rows.
+This project is not live yet, so the v2 ledger optimizes for the final SQS-first target instead of preserving a smooth migration from the older Telegram-first prototype. If `AlertLedger` opens an incompatible older local table shape, it recreates that local table in the current v2/manual-test shape rather than carrying forward compatibility-only rows.
 
 The current v2 tables are:
 
@@ -82,4 +82,4 @@ The current v2 tables are:
 - `alert_transitions`: one incident-action candidate per deterministic `transition_key`.
 - `alert_incidents`: incident state keyed by `incident_id`, with active CloudWatch incidents uniquely constrained by `project_slug + incident_fingerprint`.
 
-Manual/Telegram-oriented helper columns remain in `alert_messages` and `alert_incidents` only as clearly named local fallback support for existing commands/tests while the SQS-first workflow is completed. Manual fallback incidents use `manual:<project>:<scope-and-task-digest>` project slugs so their route-scoped state cannot collide with the canonical SQS/CloudWatch uniqueness rule. They should not be treated as the durable intake boundary.
+Manual helper columns remain in `alert_messages` and `alert_incidents` only for local project-scoped dry-run commands and tests. Manual incidents use `manual:<project>:<scope-and-task-digest>` project slugs so their route-scoped state cannot collide with the canonical SQS/CloudWatch uniqueness rule. They should not be treated as the durable intake boundary.

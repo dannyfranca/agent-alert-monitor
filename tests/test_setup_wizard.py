@@ -19,6 +19,44 @@ def _input_from(values: list[str], prompts: list[str]):
     return input_fn
 
 
+def _base_inputs(*, aws: bool = False, aws_dir: str = "") -> list[str]:
+    values = [
+        "",  # state dir
+        "1",  # project count
+        "Sample API",
+        "sample-api",
+        "",  # queue env default
+        "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts",
+        "",  # dlq url env default
+        "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts-dlq",
+        "",  # dlq arn env default
+        "arn:aws:sqs:sa-east-1:123:sample-api-alerts-dlq",
+        "",  # region default
+        "",  # envelope default
+        "",  # telegram status token env default
+        "-100111",
+        "alert-coordinator",
+        "sample-api-incidents",
+        "debugger",
+        "",  # tenant default
+        "",  # default priority
+        "",  # critical priority
+        "",  # message prefix
+        "y" if aws else "n",
+    ]
+    if aws:
+        values.extend(
+            [
+                aws_dir,
+                "alert-monitor-readonly",
+                "sa-east-1",
+                "AKIAREADONLY",
+            ]
+        )
+    values.append("n")  # install systemd
+    return values
+
+
 def test_interactive_setup_writes_config_env_and_prints_data_instructions(tmp_path: Path) -> None:
     prompts: list[str] = []
     output: list[str] = []
@@ -53,26 +91,7 @@ def test_interactive_setup_writes_config_env_and_prints_data_instructions(tmp_pa
 
     result = run_setup_wizard(
         root=tmp_path,
-        input_fn=_input_from(
-            [
-                "",  # state dir
-                "1",  # project count
-                "Sample API",
-                "sample-api",
-                "",  # token env default
-                "-100111",
-                "alert-coordinator",
-                "sample-api-incidents",
-                "debugger",
-                "",  # tenant default
-                "",  # default priority
-                "",  # critical priority
-                "",  # message prefix
-                "n",  # optional AWS instructions
-                "n",  # install systemd
-            ],
-            prompts,
-        ),
+        input_fn=_input_from(_base_inputs(), prompts),
         secret_fn=lambda prompt: "123456:telegram-token",
         print_fn=output.append,
         command_runner=runner,
@@ -89,21 +108,50 @@ def test_interactive_setup_writes_config_env_and_prints_data_instructions(tmp_pa
 
     config = yaml.safe_load(result.config_path.read_text(encoding="utf-8"))
     assert config["default_project"] == "sample-api"
-    assert config["projects"][0]["telegram"]["bot_token_env"] == (
-        "ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN"
-    )
-    assert config["projects"][0]["hermes"]["kanban_board"] == "sample-api-incidents"
-    assert config["projects"][0]["kanban"]["incident_assignee"] == "debugger"
+    project = config["projects"][0]
+    assert project["sources"][0]["type"] == "aws_sqs"
+    assert project["sources"][0]["queue_url_env"] == "SAMPLE_API_AGENT_ALERT_QUEUE_URL"
+    assert project["sources"][0]["dlq_queue_url_env"] == "SAMPLE_API_AGENT_ALERT_DLQ_URL"
+    assert project["sources"][0]["dlq_queue_arn_env"] == "SAMPLE_API_AGENT_ALERT_DLQ_ARN"
+    assert project["sinks"][0]["bot_token_env"] == "ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN"
+    assert project["sinks"][0]["chat_id"] == "-100111"
+    assert project["hermes"]["kanban_board"] == "sample-api-incidents"
+    assert project["kanban"]["incident_assignee"] == "debugger"
 
     env_text = result.env_path.read_text(encoding="utf-8")
     assert f"ALERT_MONITOR_STATE_DIR='{tmp_path / 'state'}'" in env_text
+    queue_line = (
+        "SAMPLE_API_AGENT_ALERT_QUEUE_URL="
+        "'https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts'"
+    )
+    assert queue_line in env_text
+    assert "ALERT_MONITOR_SQS_SOURCE='sample-api-prod-alerts'" in env_text
+    assert (
+        "SAMPLE_API_AGENT_ALERT_DLQ_URL="
+        "'https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts-dlq'"
+    ) in env_text
+    assert (
+        "SAMPLE_API_AGENT_ALERT_DLQ_ARN="
+        "'arn:aws:sqs:sa-east-1:123:sample-api-alerts-dlq'"
+    ) in env_text
     assert "ALERT_MONITOR_SAMPLE_API_TELEGRAM_BOT_TOKEN='123456:telegram-token'" in env_text
 
     rendered = "\n".join([*prompts, *output])
+    assert "Existing dedicated SQS queue" in rendered
     assert "@BotFather" in rendered
-    assert "add it as an admin" in rendered
+    assert "status bot" in rendered
     assert "hermes profile create" in rendered
     assert "hermes -p alert-coordinator kanban boards create sample-api-incidents" in rendered
+    assert "sqs-ingest --source sample-api-prod-alerts --dry-run" in rendered
+    for removed in [
+        "getUpdates",
+        "deleteWebhook",
+        "drop_pending_updates",
+        "offset_path",
+        "Telegram fallback",
+        "listener bot",
+    ]:
+        assert removed not in rendered
     assert ["hermes", "profile", "list"] in commands
 
 
@@ -151,6 +199,14 @@ def test_setup_wizard_repompts_duplicate_project_slugs(tmp_path: Path) -> None:
                 "Sample API",
                 "sample-api",
                 "",
+                "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts",
+                "",
+                "https://sqs.sa-east-1.amazonaws.com/123/sample-api-alerts-dlq",
+                "",
+                "arn:aws:sqs:sa-east-1:123:sample-api-alerts-dlq",
+                "",
+                "",
+                "",
                 "-100111",
                 "alert-coordinator",
                 "sample-api-incidents",
@@ -162,6 +218,14 @@ def test_setup_wizard_repompts_duplicate_project_slugs(tmp_path: Path) -> None:
                 "Worker Queue",
                 "sample-api",
                 "worker-queue",
+                "",
+                "https://sqs.sa-east-1.amazonaws.com/123/worker-alerts",
+                "",
+                "https://sqs.sa-east-1.amazonaws.com/123/worker-alerts-dlq",
+                "",
+                "arn:aws:sqs:sa-east-1:123:worker-alerts-dlq",
+                "",
+                "",
                 "",
                 "-100222",
                 "worker-coordinator",
@@ -222,8 +286,6 @@ def test_setup_wizard_collects_writes_and_validates_aws_readonly_credentials(
             def json(self) -> dict[str, object]:
                 if url.endswith("/getMe"):
                     return {"ok": True, "result": {"id": 123456, "username": "sample_alert_bot"}}
-                if url.endswith("/getWebhookInfo"):
-                    return {"ok": True, "result": {"url": ""}}
                 if url.endswith("/getChatMember"):
                     return {
                         "ok": True,
@@ -235,30 +297,7 @@ def test_setup_wizard_collects_writes_and_validates_aws_readonly_credentials(
 
     result = run_setup_wizard(
         root=tmp_path,
-        input_fn=_input_from(
-            [
-                "",
-                "1",
-                "Sample API",
-                "sample-api",
-                "",
-                "-100111",
-                "alert-coordinator",
-                "sample-api-incidents",
-                "debugger",
-                "",
-                "",
-                "",
-                "",
-                "y",
-                str(aws_dir),
-                "alert-monitor-readonly",
-                "sa-east-1",
-                "AKIAREADONLY",
-                "n",
-            ],
-            [],
-        ),
+        input_fn=_input_from(_base_inputs(aws=True, aws_dir=str(aws_dir)), []),
         secret_fn=secret_fn,
         print_fn=output.append,
         command_runner=runner,

@@ -34,9 +34,9 @@ Only create coder cards for likely code fixes. The coder opens a normal project 
 
 Telegram is a status/final-message sink. It should show investigating, correlated, PR-opened, blocked, and resolved messages for humans, but it is not the source of truth for new SQS-first intake, dedupe, recovery matching, or lifecycle decisions.
 
-## Legacy/manual fallback
+## Manual alert dry-runs
 
-Telegram polling may remain as a clearly named manual/fallback path for tests or emergency use. Do not let fallback Telegram message ids collide with SQS CloudWatch incidents; fallback state should stay route-scoped and separate from SQS `event_id`/`transition_key`/`incident_fingerprint` records.
+Project-scoped `manual-alert --dry-run` is for local validation only. Do not use manual alert text or Telegram channel history as an intake source for production incidents.
 
 ## No-silence rule
 

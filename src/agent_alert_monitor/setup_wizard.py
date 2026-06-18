@@ -103,12 +103,9 @@ def run_setup_wizard(
 
     print_fn("Agent Alert Monitor interactive setup")
     print_fn("You will need:")
-    print_fn("- A Telegram listener bot token from @BotFather (/newbot).")
-    print_fn("- The listener bot; add it as an admin to each alert channel.")
-    print_fn(
-        "- Each alert channel id, usually -100...; discover it through the listener "
-        "bot getUpdates flow."
-    )
+    print_fn("- Existing dedicated SQS queue URL for each monitored alert source.")
+    print_fn("- A Telegram status bot token from @BotFather (/newbot).")
+    print_fn("- Add the status bot as an admin to each status channel.")
     print_fn(
         "- Hermes profiles/boards ready, or permission to create them with the commands "
         "shown below."
@@ -163,9 +160,63 @@ def run_setup_wizard(
                 break
             print_fn(f"❌ Project slug already used: {slug}. Choose a unique slug.")
         while True:
+            queue_url_env = _ask(
+                input_fn,
+                "SQS queue URL env var",
+                f"{_env_slug(slug)}_AGENT_ALERT_QUEUE_URL",
+            )
+            if not _is_env_name(queue_url_env):
+                print_fn(f"❌ Invalid environment variable name: {queue_url_env}")
+                continue
+            if queue_url_env in env_values or queue_url_env in _reserved_env_names():
+                print_fn(f"❌ Environment variable name already used/reserved: {queue_url_env}")
+                continue
+            break
+        queue_url = _ask_required(input_fn, print_fn, "Existing SQS queue URL")
+        env_values[queue_url_env] = queue_url
+        while True:
+            dlq_url_env = _ask(
+                input_fn,
+                "SQS DLQ URL env var",
+                f"{_env_slug(slug)}_AGENT_ALERT_DLQ_URL",
+            )
+            if not _is_env_name(dlq_url_env):
+                print_fn(f"❌ Invalid environment variable name: {dlq_url_env}")
+                continue
+            if dlq_url_env in env_values or dlq_url_env in _reserved_env_names():
+                print_fn(f"❌ Environment variable name already used/reserved: {dlq_url_env}")
+                continue
+            break
+        dlq_url = _ask_required(input_fn, print_fn, "Existing SQS DLQ URL")
+        env_values[dlq_url_env] = dlq_url
+        while True:
+            dlq_arn_env = _ask(
+                input_fn,
+                "SQS DLQ ARN env var",
+                f"{_env_slug(slug)}_AGENT_ALERT_DLQ_ARN",
+            )
+            if not _is_env_name(dlq_arn_env):
+                print_fn(f"❌ Invalid environment variable name: {dlq_arn_env}")
+                continue
+            if dlq_arn_env in env_values or dlq_arn_env in _reserved_env_names():
+                print_fn(f"❌ Environment variable name already used/reserved: {dlq_arn_env}")
+                continue
+            break
+        dlq_arn = _ask_required(input_fn, print_fn, "Existing SQS DLQ ARN")
+        env_values[dlq_arn_env] = dlq_arn
+        aws_region = _ask(input_fn, "SQS/AWS region", "sa-east-1")
+        envelope = _ask(input_fn, "CloudWatch envelope", "aws_sns_cloudwatch_alarm")
+        while envelope not in {"aws_sns_cloudwatch_alarm", "aws_eventbridge_cloudwatch_alarm"}:
+            print_fn(
+                "❌ Envelope must be aws_sns_cloudwatch_alarm or "
+                "aws_eventbridge_cloudwatch_alarm."
+            )
+            envelope = _ask(input_fn, "CloudWatch envelope", "aws_sns_cloudwatch_alarm")
+
+        while True:
             token_env = _ask(
                 input_fn,
-                "Telegram bot token env var",
+                "Telegram status bot token env var",
                 f"ALERT_MONITOR_{_env_slug(slug)}_TELEGRAM_BOT_TOKEN",
             )
             if not _is_env_name(token_env):
@@ -175,42 +226,33 @@ def run_setup_wizard(
                 print_fn(f"❌ Environment variable name already used/reserved: {token_env}")
                 continue
             break
-        print_fn(
-            "Telegram token: create a dedicated listener bot with @BotFather (/newbot); "
-            "do not reuse the alert-posting bot because bots do not receive their own posts."
-        )
+        print_fn("Telegram status token: create a dedicated status bot with @BotFather (/newbot).")
         while True:
-            token = secret_fn(f"Telegram bot token for {display_name} (input hidden): ")
+            token = secret_fn(f"Telegram status bot token for {display_name} (input hidden): ")
             if token:
                 env_values[token_env] = token
                 break
-            print_fn("❌ Telegram bot token is required.")
+            print_fn("❌ Telegram status bot token is required.")
         print_fn(
-            "Alert chat id: add the listener bot as an admin and post a test alert. "
-            "If you leave the next prompt blank, the wizard will call getUpdates with "
-            "the hidden token and print candidate chat ids without exposing the token."
+            "Status chat id: add the status bot as an admin to the channel used "
+            "for visible updates."
         )
-        alert_chat_id = input_fn(
-            "Telegram alert channel id [leave blank to list recent chats]: "
-        ).strip()
-        if not alert_chat_id:
-            _print_recent_chat_ids(print_fn, telegram_get, token)
-            alert_chat_id = _ask(input_fn, "Telegram alert channel id", "-1001234567890")
+        alert_chat_id = _ask_required(input_fn, print_fn, "Telegram status channel id")
         used_chat_ids = chat_ids_by_token.setdefault(token, set())
         while True:
             if not _is_numeric_chat_id(alert_chat_id):
                 print_fn(
-                    "❌ Telegram alert channel id must be the numeric chat.id, usually -100..."
+                    "❌ Telegram status channel id must be the numeric chat.id, "
+                    "usually -100..."
                 )
-                _print_recent_chat_ids(print_fn, telegram_get, token)
             elif alert_chat_id in used_chat_ids:
                 print_fn(
                     "❌ Projects sharing one Telegram bot token must use unique "
-                    "alert chat ids."
+                    "status chat ids."
                 )
             else:
                 break
-            alert_chat_id = _ask(input_fn, "Telegram alert channel id", "-1001234567890")
+            alert_chat_id = _ask(input_fn, "Telegram status channel id", "-1001234567890")
         used_chat_ids.add(alert_chat_id)
         coordinator_profile = _ask(input_fn, "Hermes coordinator profile", "alert-coordinator")
         kanban_board = _ask(input_fn, "Hermes Kanban board slug", f"{slug}-incidents")
@@ -243,12 +285,29 @@ def run_setup_wizard(
             {
                 "slug": slug,
                 "display_name": display_name,
-                "telegram": {
-                    "bot_token_env": token_env,
-                    "alert_chat_id": alert_chat_id,
-                    "poll_interval_seconds": 5,
-                    "offset_path": f"${{ALERT_MONITOR_STATE_DIR}}/{slug}-telegram-offset.json",
-                },
+                "sources": [
+                    {
+                        "name": f"{slug}-prod-alerts",
+                        "type": "aws_sqs",
+                        "queue_url_env": queue_url_env,
+                        "dlq_queue_url_env": dlq_url_env,
+                        "dlq_queue_arn_env": dlq_arn_env,
+                        "region": aws_region,
+                        "envelope": envelope,
+                        "wait_time_seconds": 20,
+                        "max_messages": 10,
+                        "visibility_timeout_seconds": 300,
+                        "delete_policy": "after_successful_side_effects",
+                    }
+                ],
+                "sinks": [
+                    {
+                        "name": f"{slug}-telegram-status",
+                        "type": "telegram",
+                        "bot_token_env": token_env,
+                        "chat_id": alert_chat_id,
+                    }
+                ],
                 "hermes": {
                     "coordinator_profile": coordinator_profile,
                     "kanban_board": kanban_board,
@@ -265,6 +324,9 @@ def run_setup_wizard(
         )
 
     aws_setup: AwsSetup | None = None
+    if projects:
+        env_values.setdefault("ALERT_MONITOR_SQS_SOURCE", f"{projects[0]['slug']}-prod-alerts")
+
     want_aws = _yes_no(
         input_fn, "Configure AWS CloudWatch/Logs readonly credentials now?", False
     )
@@ -364,22 +426,14 @@ def run_setup_wizard(
     render_systemd = _yes_no(input_fn, "Render systemd user unit files now?", False)
     if render_systemd:
         checks_failed += _run_systemd_install(print_fn, command_runner, root)
-    print_fn("Before live start, clear Telegram webhooks and pending test updates:")
-    print_fn(f"cd {_shell_env_value(str(root))}")
-    print_fn("set -a; . ./.env; set +a")
-    print_fn("python - <<'PY'")
-    print_fn("import os, urllib.parse, urllib.request")
-    for project in projects:
-        token_env = project["telegram"]["bot_token_env"]
-        print_fn(f"token = os.environ[{token_env!r}]")
-        print_fn("base = 'https://api.telegram.org/bot' + token + '/deleteWebhook'")
-        print_fn("query = urllib.parse.urlencode({'drop_pending_updates': 'true'})")
-        print_fn("urllib.request.urlopen(base + '?' + query, timeout=15).read()")
-    print_fn("PY")
-    print_fn("Systemd start after dry-run + offset/webhook verification:")
+    print_fn(
+        "Before live start, verify the SQS queue, Hermes profiles, Kanban board, "
+        "and Telegram status sink."
+    )
+    print_fn("Systemd start after SQS dry-run verification:")
     print_fn("  ./scripts/systemd-install.sh")
     print_fn(
-        "  systemctl --user enable --now agent-alert-monitor-ingest.service "
+        "  systemctl --user enable --now agent-alert-monitor-sqs-listen.service "
         "agent-alert-monitor-watchdog.timer"
     )
 
@@ -394,9 +448,19 @@ def run_setup_wizard(
     print_fn("  source .venv/bin/activate  # if using the local repo install")
     print_fn("  set -a; . ./.env; set +a")
     for project in projects:
+        source = project["sources"][0]
+        source_name = source["name"]
         print_fn(
             "  agent-alert-monitor --config config.yaml --project "
-            f"{project['slug']} synthetic-alert --text "
+            f"{project['slug']} health --source {source_name} --json"
+        )
+        print_fn(
+            "  agent-alert-monitor --config config.yaml --project "
+            f"{project['slug']} sqs-ingest --source {source_name} --dry-run"
+        )
+        print_fn(
+            "  agent-alert-monitor --config config.yaml --project "
+            f"{project['slug']} manual-alert --text "
             "'CRITICAL ALARM: Service5xx service=api' --dry-run"
         )
         hermes = project["hermes"]
@@ -406,7 +470,6 @@ def run_setup_wizard(
             f"{hermes['kanban_board']} create 'setup smoke incident' "
             f"--assignee {kanban['incident_assignee']} --body 'Verify alert monitor routing.'"
         )
-    print_fn("  agent-alert-monitor --config config.yaml ingest --dry-run")
 
     messages.append("setup completed")
     return SetupResult(config_path, env_path, checks_failed, messages)
@@ -721,37 +784,6 @@ def _resolve_state_dir(root: Path, state_dir: str) -> Path:
     return path
 
 
-def _print_recent_chat_ids(
-    print_fn: PrintFn, telegram_get: TelegramGet, token: str
-) -> None:
-    try:
-        response = telegram_get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            {"timeout": 0, "allowed_updates": '["channel_post","message"]'},
-            15,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        updates = payload.get("result")
-        if not isinstance(updates, list) or not updates:
-            print_fn("No recent Telegram updates found; post a test alert and try again.")
-            return
-        print_fn("Recent Telegram chat candidates:")
-        for item in updates[-10:]:
-            if not isinstance(item, dict):
-                continue
-            post = item.get("channel_post") or item.get("message") or {}
-            if not isinstance(post, dict):
-                continue
-            chat = post.get("chat") or {}
-            if not isinstance(chat, dict) or "id" not in chat:
-                continue
-            title = chat.get("title") or chat.get("username") or chat.get("type") or "unknown"
-            print_fn(f"- chat.id={chat['id']} title={title}")
-    except Exception as exc:
-        print_fn(f"Could not list recent Telegram chats: {_safe_validation_error(exc)}")
-
-
 @contextmanager
 def _temporary_env(values: dict[str, str | None]):
     old_values = {key: os.environ.get(key) for key in values}
@@ -852,9 +884,8 @@ def _validate_telegram(
     failures = 0
     bot_user_id: int | None = None
     checks: list[tuple[str, str, dict[str, str | int] | None]] = [
-        ("Telegram bot token", "getMe", None),
-        ("Telegram alert chat access", "getChat", {"chat_id": alert_chat_id}),
-        ("Telegram webhook status", "getWebhookInfo", None),
+        ("Telegram status bot token", "getMe", None),
+        ("Telegram status chat access", "getChat", {"chat_id": alert_chat_id}),
     ]
     for name, path, params in checks:
         try:
@@ -868,8 +899,6 @@ def _validate_telegram(
                 raw_id = result.get("id")
                 if isinstance(raw_id, int):
                     bot_user_id = raw_id
-            if path == "getWebhookInfo" and isinstance(result, dict) and result.get("url"):
-                raise RuntimeError("webhook is configured; clear it before polling")
         except Exception as exc:
             print_fn(f"❌ {name} check failed: {_safe_validation_error(exc)}")
             failures += 1

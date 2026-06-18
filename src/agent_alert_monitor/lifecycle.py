@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -163,27 +164,52 @@ def sync_debugger_result(
         return LifecycleSyncResult("resolved", incident_id, status="resolved")
 
     if result.classification == "code-fix-likely":
+        if incident.status == "code_fix_queued" and incident.coder_task_id:
+            channel_status = incident.last_channel_status
+            if result.telegram_status is not None and channel_status != "progress":
+                status_sender(cfg, _debugger_status_message(cfg, result, incident))
+                channel_status = "progress"
+                ledger.update_incident_status(
+                    incident.incident_task_id,
+                    status="code_fix_queued",
+                    last_channel_status=channel_status,
+                    coder_task_id=incident.coder_task_id,
+                    incident_scope=incident.incident_scope,
+                )
+            return LifecycleSyncResult(
+                "coder_queued",
+                incident_id,
+                status="code_fix_queued",
+                coder_task_id=incident.coder_task_id,
+            )
         coder_task_id = _create_coder_card(cfg, kanban_client, incident, result)
+        ledger.update_incident_status(
+            incident.incident_task_id,
+            status="code_fix_queued",
+            coder_task_id=coder_task_id,
+            incident_scope=incident.incident_scope,
+        )
         channel_status = None
         if result.telegram_status is not None:
             status_sender(cfg, _debugger_status_message(cfg, result, incident))
             channel_status = "progress"
-        ledger.update_incident_status(
-            incident.incident_task_id,
-            status="code_fix_queued",
-            last_channel_status=channel_status,
-            coder_task_id=coder_task_id,
-            incident_scope=incident.incident_scope,
-        )
-        _comment_on_incident(
-            ledger,
-            kanban_client,
-            incident,
-            (
-                f"Debugger classified incident as code-fix-likely; queued coder task "
-                f"`{coder_task_id}`.\n\nEvidence:\n{_evidence_markdown(result.evidence)}"
-            ),
-        )
+            ledger.update_incident_status(
+                incident.incident_task_id,
+                status="code_fix_queued",
+                last_channel_status=channel_status,
+                coder_task_id=coder_task_id,
+                incident_scope=incident.incident_scope,
+            )
+        with suppress(Exception):
+            _comment_on_incident(
+                ledger,
+                kanban_client,
+                incident,
+                (
+                    f"Debugger classified incident as code-fix-likely; queued coder task "
+                    f"`{coder_task_id}`.\n\nEvidence:\n{_evidence_markdown(result.evidence)}"
+                ),
+            )
         return LifecycleSyncResult(
             "coder_queued", incident_id, status="code_fix_queued", coder_task_id=coder_task_id
         )
@@ -336,6 +362,12 @@ def _require_debugger_syncable_incident(incident: Incident, result: DebuggerResu
         return
     if incident.status == "self_recovered" and result.classification == "self-recovered/transient":
         return
+    if (
+        incident.status == "code_fix_queued"
+        and result.classification == "code-fix-likely"
+        and incident.coder_task_id
+    ):
+        return
     raise ValueError(
         "debugger_result updates require an active debugger lifecycle incident"
     )
@@ -360,12 +392,15 @@ def _create_coder_card(
     result: DebuggerResult,
 ) -> str:
     assignee = cfg.kanban.coder_assignee or "coder"
+    cloud_context = _cloud_context_markdown(incident)
     body = f"""# Code Fix Candidate for CloudWatch Incident
 
 Parent incident: {incident.incident_task_id}
 Original incident marker: {incident.incident_task_id}
 Alarm: {incident.alarm_name or "unknown"}
 Service: {incident.service or "unknown"}
+Cloud context:
+{cloud_context}
 Evidence summary:
 {_evidence_markdown(result.evidence)}
 Suspected code area: {result.suspected_component or "unknown"}
@@ -395,6 +430,27 @@ Acceptance:
             idempotency_key=f"agent-alert-monitor:coder:{incident.incident_task_id}",
         )
     )
+
+
+def _cloud_context_markdown(incident: Incident) -> str:
+    account, region = _account_region_from_alarm_arn(incident.alarm_arn)
+    lines = [
+        f"- Project: {incident.project_slug}",
+        f"- Log group: {incident.log_group or 'unknown'}",
+        f"- Alarm ARN: {incident.alarm_arn or 'unknown'}",
+        f"- Region: {region or 'unknown'}",
+        f"- Account: {account or 'unknown'}",
+    ]
+    return "\n".join(lines)
+
+
+def _account_region_from_alarm_arn(alarm_arn: str | None) -> tuple[str | None, str | None]:
+    if not alarm_arn:
+        return None, None
+    parts = alarm_arn.split(":")
+    if len(parts) < 6 or parts[0] != "arn" or parts[2] != "cloudwatch":
+        return None, None
+    return parts[4] or None, parts[3] or None
 
 
 def _status_for_non_coder_classification(classification: str) -> IncidentLifecycleStatus:

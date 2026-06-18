@@ -288,7 +288,81 @@ def test_code_fix_likely_creates_bounded_coder_card_and_tracks_task_id(
     assert "payment processor webhook handling" in card.body
     assert "Do not change alert thresholds as a first response." in card.body
     assert "Original incident marker" in card.body
+    assert "Cloud context:" in card.body
+    assert "Log group: /aws/lambda/payment-processor-prod-lambda" in card.body
+    assert "Alarm ARN: arn:aws:cloudwatch:sa-east-1:123456789012:alarm:" in card.body
+    assert "Region: sa-east-1" in card.body
+    assert "Account: 123456789012" in card.body
     assert telegram_messages and "coder queued" in telegram_messages[0]
+
+
+def test_code_fix_status_failure_records_coder_card_for_safe_retry(
+    tmp_path: Path,
+) -> None:
+    cfg, ledger, incident_id = _opened_incident(tmp_path)
+    kanban = FakeKanbanClient()
+
+    with pytest.raises(RuntimeError, match="status down"):
+        sync_debugger_result(
+            cfg,
+            ledger=ledger,
+            kanban_client=kanban,
+            incident_id=incident_id,
+            payload=_debugger_result(incident_id=incident_id),
+            status_sender=lambda _cfg, _text: (_ for _ in ()).throw(RuntimeError("status down")),
+        )
+
+    incident = ledger.get_cloud_incident_by_id(incident_id)
+    assert incident is not None
+    assert incident.status == "code_fix_queued"
+    assert incident.coder_task_id == "t_coder_1"
+    assert incident.last_channel_status is None
+    assert len(kanban.created) == 1
+
+    telegram_messages: list[str] = []
+    retry = sync_debugger_result(
+        cfg,
+        ledger=ledger,
+        kanban_client=kanban,
+        incident_id=incident_id,
+        payload=_debugger_result(incident_id=incident_id),
+        status_sender=lambda _cfg, text: telegram_messages.append(text),
+    )
+
+    retried_incident = ledger.get_cloud_incident_by_id(incident_id)
+    assert retry.action == "coder_queued"
+    assert retry.coder_task_id == "t_coder_1"
+    assert retried_incident is not None
+    assert retried_incident.last_channel_status == "progress"
+    assert len(kanban.created) == 1
+    assert telegram_messages and "coder queued" in telegram_messages[0]
+
+
+def test_code_fix_retry_after_success_is_idempotent(tmp_path: Path) -> None:
+    cfg, ledger, incident_id = _opened_incident(tmp_path)
+    kanban = FakeKanbanClient()
+
+    first = sync_debugger_result(
+        cfg,
+        ledger=ledger,
+        kanban_client=kanban,
+        incident_id=incident_id,
+        payload=_debugger_result(incident_id=incident_id),
+        status_sender=lambda _cfg, _text: None,
+    )
+    second = sync_debugger_result(
+        cfg,
+        ledger=ledger,
+        kanban_client=kanban,
+        incident_id=incident_id,
+        payload=_debugger_result(incident_id=incident_id),
+        status_sender=lambda _cfg, _text: None,
+    )
+
+    assert first.action == "coder_queued"
+    assert second.action == "coder_queued"
+    assert second.coder_task_id == "t_coder_1"
+    assert len(kanban.created) == 1
 
 
 def test_record_pr_reference_tracks_transition_without_closing_incident(tmp_path: Path) -> None:

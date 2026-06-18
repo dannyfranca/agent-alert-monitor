@@ -41,6 +41,9 @@ class Incident:
     severity: str | None
     alarm_name: str | None
     service: str | None
+    project_slug: str
+    alarm_arn: str | None
+    log_group: str | None
     first_event_id: str
     last_event_id: str
     first_seen_at: str

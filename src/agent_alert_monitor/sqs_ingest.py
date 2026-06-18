@@ -379,6 +379,21 @@ def _process_live_sqs_message(
         "deleted": False,
     }
 
+    if process_result.duplicate_transition:
+        ledger.record_alert_side_effect(
+            alert.event_id,
+            REQUIRED_SIDE_EFFECTS,
+            "succeeded",
+            {"action": process_result.action, "incident_id": process_result.incident_id},
+        )
+        try:
+            _delete_message(client, source, sqs_message)
+        except Exception as exc:
+            row["error"] = _safe_client_error(exc)
+            return row
+        row["deleted"] = True
+        return row
+
     if ledger.alert_side_effect_succeeded(alert.event_id, REQUIRED_SIDE_EFFECTS):
         try:
             _delete_message(client, source, sqs_message)

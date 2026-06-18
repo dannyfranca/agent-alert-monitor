@@ -250,6 +250,32 @@ def _sqs_response_from_sns_fixture(
     }
 
 
+def _sqs_response_with_sns_overrides(
+    fixture_name: str,
+    *,
+    sqs_message_id: str,
+    sns_message_id: str,
+    receipt_handle: str,
+    cloudwatch_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    envelope = _fixture(fixture_name)
+    envelope["MessageId"] = sns_message_id
+    cloudwatch_message = json.loads(envelope["Message"])
+    cloudwatch_message.update(cloudwatch_overrides or {})
+    envelope["Message"] = json.dumps(cloudwatch_message)
+    return {
+        "Messages": [
+            {
+                "MessageId": sqs_message_id,
+                "ReceiptHandle": receipt_handle,
+                "Attributes": {"ApproximateReceiveCount": "1"},
+                "MessageAttributes": {},
+                "Body": json.dumps(envelope),
+            }
+        ]
+    }
+
+
 def test_sqs_peek_receives_and_prints_normalized_alert_without_deleting(
     tmp_path: Path, capsys, monkeypatch
 ) -> None:
@@ -795,6 +821,99 @@ def test_sqs_listen_redelivery_after_success_does_not_duplicate_card(tmp_path: P
     assert second_client.delete_calls == [
         {"QueueUrl": "https://sqs.example/queue", "ReceiptHandle": "sanitized-receipt-handle"}
     ]
+
+
+def test_duplicate_transition_is_ledger_only_and_deletes_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    cfg = _live_cfg(tmp_path)
+    ledger = AlertLedger(cfg.runtime.ledger_path)
+    first_client = RecordingSqsClient(_fixture("aws_sqs_receive_message_sns_envelope.json"))
+    duplicate_client = RecordingSqsClient(
+        _sqs_response_with_sns_overrides(
+            "aws_sns_cloudwatch_alarm_alarm.json",
+            sqs_message_id="sqs-alarm-duplicate-transition",
+            sns_message_id="sns-message-alarm-duplicate-transition",
+            receipt_handle="duplicate-transition-receipt",
+        )
+    )
+    kanban = FakeKanbanClient(fail_comment=True)
+    sent: list[str] = []
+
+    opened = listen_for_sqs_messages(
+        cfg,
+        source_name="ticketdovale-prod-alerts",
+        ledger=ledger,
+        kanban_client=kanban,
+        client=first_client,
+        preflight=_preflight_ok,
+        status_sender=lambda _cfg, text: sent.append(text),
+        once=True,
+    )
+    sent.clear()
+    duplicate = listen_for_sqs_messages(
+        cfg,
+        source_name="ticketdovale-prod-alerts",
+        ledger=ledger,
+        kanban_client=kanban,
+        client=duplicate_client,
+        preflight=_preflight_ok,
+        status_sender=lambda _cfg, _text: (_ for _ in ()).throw(RuntimeError("status down")),
+        once=True,
+    )
+
+    assert opened["messages"][0]["action"] == "opened"
+    assert duplicate["messages"][0]["action"] == "duplicate_transition"
+    assert duplicate["messages"][0]["deleted"] is True
+    assert duplicate_client.delete_calls == [
+        {"QueueUrl": "https://sqs.example/queue", "ReceiptHandle": "duplicate-transition-receipt"}
+    ]
+    assert len(kanban.created) == 1
+    assert kanban.comments == []
+    assert sent == []
+    with ledger.connect() as conn:
+        duplicate_event = conn.execute(
+            "SELECT parse_status FROM alert_events WHERE event_id LIKE ?",
+            ("%sns-message-alarm-duplicate-transition",),
+        ).fetchone()
+    assert duplicate_event is not None
+    assert duplicate_event["parse_status"] == "parsed"
+
+
+def test_sqs_listen_malformed_cloud_timestamp_is_parse_failed_not_crash(
+    tmp_path: Path,
+) -> None:
+    cfg = _live_cfg(tmp_path)
+    ledger = AlertLedger(cfg.runtime.ledger_path)
+    client = RecordingSqsClient(
+        _sqs_response_with_sns_overrides(
+            "aws_sns_cloudwatch_alarm_alarm.json",
+            sqs_message_id="sqs-bad-timestamp",
+            sns_message_id="sns-bad-timestamp",
+            receipt_handle="bad-timestamp-receipt",
+            cloudwatch_overrides={"StateChangeTime": "not-a-timestamp"},
+        )
+    )
+    result = listen_for_sqs_messages(
+        cfg,
+        source_name="ticketdovale-prod-alerts",
+        ledger=ledger,
+        kanban_client=FakeKanbanClient(),
+        client=client,
+        preflight=_preflight_ok,
+        once=True,
+    )
+    assert result["messages"][0]["action"] == "parse_failed"
+    assert result["messages"][0]["deleted"] is False
+    assert client.delete_calls == []
+    with ledger.connect() as conn:
+        event = conn.execute(
+            "SELECT parse_status, parse_error FROM alert_events WHERE event_id LIKE ?",
+            ("parse-failed:ticketdovale-prod-alerts:sqs-bad-timestamp:%",),
+        ).fetchone()
+    assert event is not None
+    assert event["parse_status"] == "failed"
+    assert "StateChangeTime" in event["parse_error"]
 
 
 def test_sqs_listen_kanban_failure_persists_event_but_does_not_delete(tmp_path: Path) -> None:

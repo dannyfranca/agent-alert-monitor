@@ -2,7 +2,11 @@
 
 ## Incident cards
 
-New alerts create high-priority cards assigned to the selected project's configured debugger assignee. The idempotency key is `alert-monitor:<project-scoped-fingerprint>:<message-id>` so repeated alerts do not fan out duplicate workers and identical alarms in different projects stay isolated.
+SQS CloudWatch `ALARM` transitions create or correlate high-priority cards assigned to the selected project's configured debugger assignee. The local ledger, not Kanban text, owns durable idempotency and correlation:
+
+- `event_id` prevents processing the same SQS/SNS/EventBridge delivery twice.
+- `transition_key` prevents duplicate incident actions for the same CloudWatch state transition.
+- `incident_fingerprint` correlates ALARM/OK lifecycle state for the same alarm source.
 
 Default priorities are configurable per project. The example config uses:
 
@@ -24,7 +28,15 @@ Debugger workers should classify exactly one final state:
 
 ## Coder handoff
 
-Only create coder cards for likely code fixes. The coder opens a normal project PR, includes the canonical Kanban task marker in the PR body, posts PR status to the alert channel, and blocks `review-required` until human/reviewer approval.
+Only create coder cards for likely code fixes. The coder opens a normal project PR, includes the canonical Kanban task marker in the PR body, posts PR status back to the incident lifecycle, and blocks `review-required` until human/reviewer approval.
+
+## Telegram status output
+
+Telegram is a status/final-message sink. It should show investigating, correlated, PR-opened, blocked, and resolved messages for humans, but it is not the source of truth for new SQS-first intake, dedupe, recovery matching, or lifecycle decisions.
+
+## Legacy/manual fallback
+
+Telegram polling may remain as a clearly named manual/fallback path for tests or emergency use. Do not let fallback Telegram message ids collide with SQS CloudWatch incidents; fallback state should stay route-scoped and separate from SQS `event_id`/`transition_key`/`incident_fingerprint` records.
 
 ## No-silence rule
 

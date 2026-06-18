@@ -7,9 +7,10 @@ watchdog:
   progress_sla_seconds: 600
   stalled_after_seconds: 900
 
-# One install can monitor several independent projects/channels. Each project has
-# its own Telegram source, Hermes profile/board routing, Kanban tenant/assignee,
-# and channel message prefix. Secrets are still referenced by env var name only.
+# One install can monitor several independent projects. Each SQS-first project has
+# one or more cloud queue sources, Telegram status sinks, Hermes profile/board
+# routing, Kanban tenant/assignee, and channel message prefix. Secrets are still
+# referenced by env var name only.
 default_project: sample-api
 projects:
   - slug: sample-api
@@ -47,6 +48,44 @@ projects:
       critical_priority: 2000
     messages:
       prefix: Sample API alert monitor
+
+  # TicketDoVale production should use the dedicated queue values supplied by the
+  # cloud operator, not Telegram channel history. Uncomment and adapt after the
+  # ticketdovale queue URL/ARN/DLQ outputs and status chat are available.
+  # - slug: ticketdovale
+  #   display_name: TicketDoVale
+  #   environment: prod
+  #   sources:
+  #     - name: ticketdovale-prod-alerts
+  #       type: aws_sqs
+  #       queue_url_env: TICKETDOVALE_AGENT_ALERT_QUEUE_URL
+  #       queue_arn_env: TICKETDOVALE_AGENT_ALERT_QUEUE_ARN
+  #       dlq_queue_url_env: TICKETDOVALE_AGENT_ALERT_DLQ_URL
+  #       dlq_queue_arn_env: TICKETDOVALE_AGENT_ALERT_DLQ_ARN
+  #       region: sa-east-1
+  #       envelope: aws_sns_cloudwatch_alarm
+  #       wait_time_seconds: 20
+  #       max_messages: 10
+  #       visibility_timeout_seconds: 300
+  #       delete_policy: after_successful_side_effects
+  #   sinks:
+  #     - name: ticketdovale-telegram-status
+  #       type: telegram
+  #       bot_token_env: ALERT_MONITOR_TICKETDOVALE_TELEGRAM_BOT_TOKEN
+  #       chat_id_env: ALERT_MONITOR_TICKETDOVALE_TELEGRAM_CHAT_ID
+  #   hermes:
+  #     coordinator_profile: alert-coordinator
+  #     kanban_board: "ticketdovale-incidents"
+  #     channel_target: "telegram:${ALERT_MONITOR_TICKETDOVALE_TELEGRAM_CHAT_ID}"
+  #   kanban:
+  #     incident_assignee: debugger
+  #     coder_assignee: coder
+  #     reviewer_assignee: reviewer
+  #     tenant: ticketdovale
+  #     default_priority: 1000
+  #     critical_priority: 2000
+  #   messages:
+  #     prefix: TicketDoVale alert monitor
 
   - slug: worker-queue
     display_name: Worker Queue

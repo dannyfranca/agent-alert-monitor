@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-alert-monitor"
 version = "0.1.0"
-description = "Local Telegram-to-Hermes Kanban incident coordinator for application alerts"
+description = "Local SQS-to-Hermes Kanban incident coordinator for application alerts"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
